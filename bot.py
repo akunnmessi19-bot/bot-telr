@@ -928,6 +928,92 @@ async def poller(bot: Bot):
         await asyncio.sleep(4)
 
 
+# ---------- laporan trafik (/trafik + kirim otomatis ke channel) ----------
+TRAFFIC_EVERY = 3 * 3600  # kirim otomatis tiap 3 jam
+
+
+def pick_services(services):
+    """Pilih 3 layanan: Google/YouTube/Gmail, WhatsApp, dan satu layanan populer lain yang aktif."""
+    active = [s for s in services if s.get("active")]
+    google = next((s for s in active if any(k in s["name"].lower() for k in ("google", "youtube", "gmail"))), None)
+    wa = next((s for s in active if "whatsapp" in s["name"].lower()), None)
+    other = None
+    for key in PRIORITY:  # urutan populer yang sudah ada di bot
+        other = next((s for s in active if key in s["name"].lower() and s is not google and s is not wa), None)
+        if other: break
+    if not other:
+        other = next((s for s in active if s is not google and s is not wa), None)
+    return [("1️⃣ Google / YouTube / Gmail", google), ("2️⃣ WhatsApp", wa),
+            (f"3️⃣ {other['name']}" if other else "3️⃣ Lainnya", other)]
+
+
+async def get_traffic_report():
+    services = await cached("/catalog/services", ttl=600)
+    if not services:
+        return "⚠️ Data katalog belum bisa diambil dari API. Coba lagi sebentar."
+    countries_map = {c["id"]: c for c in await cached("/catalog/countries", ttl=600)}
+    text = "🔥 <b>REKOMENDASI TRAFIK & STOK TERBAIK HARI INI</b>\n" + LINE + "\n"
+    text += "<i>Referensi negara & operator dengan stok dan penerimaan OTP paling stabil.</i>\n\n"
+    for label, svc in pick_services(services):
+        if not svc: continue
+        text += f"<b>{esc(label)}</b>\n"
+        products = await cached("/catalog/products", {"platform_id": svc["id"], "sort": "available_desc", "limit": 100}, ttl=60)
+        by_country = {}
+        for p in products:
+            if p.get("active") and p.get("available", 0) > 0:
+                by_country.setdefault(p["country_id"], []).append(p)
+        top = sorted(by_country.items(), key=lambda x: sum(i["available"] for i in x[1]), reverse=True)[:3]
+        if not top:
+            text += "└ <i>Stok sedang kosong</i>\n\n"
+            continue
+        for n, (cid, offs) in enumerate(top, 1):
+            c = countries_map.get(cid, {})
+            best = min(offs, key=lambda x: x.get("price", 0))
+            op = best.get("operator_name") or "Semua Operator (Any)"
+            stock = sum(i["available"] for i in offs)
+            text += (f"   {n}. {c.get('emoji', '🌍')} <b>{esc(c.get('name', 'Unknown'))}</b>\n"
+                     f"      • Operator: <code>{esc(op)}</code>\n"
+                     f"      • Harga: <b>{rp(sell_price(best['price'], c))}</b> (Stok: {stock})\n")
+        text += "\n"
+    return text + "🛒 <i>Yuk langsung amankan nomornya di bot sebelum kehabisan!</i>"
+
+
+async def traffic_poller(bot: Bot):
+    """Kirim laporan trafik ke channel monitoring tiap 3 jam."""
+    while True:
+        await asyncio.sleep(TRAFFIC_EVERY)
+        if not CHANNEL_ID: continue
+        try:
+            await bot.send_message(CHANNEL_ID, await get_traffic_report())
+            log.info("Laporan trafik otomatis terkirim ke channel.")
+        except Exception as e:
+            log.warning("Gagal kirim laporan trafik otomatis: %s", e)
+
+
+@r.message(Command("trafik"))
+async def cmd_trafik(m: Message):
+    if m.from_user.id not in ADMINS: return
+    loading = await m.answer("🔍 Menganalisis data trafik <i>real-time</i>...")
+    try:
+        text = await get_traffic_report()
+    except Exception as e:
+        log.exception("trafik gagal")
+        return await loading.edit_text(f"❌ Gagal membuat laporan: {esc(e)}")
+    await loading.edit_text(text, reply_markup=kb([[b("📡 Kirim ke Channel", "send_chan")]]))
+
+
+@r.callback_query(F.data == "send_chan")
+async def send_chan_callback(cb: CallbackQuery, bot: Bot):
+    if cb.from_user.id not in ADMINS: return await cb.answer("Khusus admin.", show_alert=True)
+    if not CHANNEL_ID:
+        return await cb.answer("CHANNEL_ID belum diisi di Variables Railway!", show_alert=True)
+    try:
+        await bot.send_message(CHANNEL_ID, await get_traffic_report())
+        await cb.answer("✅ Berhasil dikirim ke channel!", show_alert=True)
+    except Exception as e:
+        await cb.answer(f"Gagal kirim: {e}"[:190], show_alert=True)
+
+
 async def main():
     global db, http
     db = await aiosqlite.connect("store.db")
@@ -955,11 +1041,13 @@ async def main():
         await web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
         log.info("Webhook Kasera aktif di port %s", WEBHOOK_PORT)
     task = asyncio.create_task(poller(bot))
+    ttask = asyncio.create_task(traffic_poller(bot))
     try:
         await dp_.start_polling(bot)
     finally:
         if runner: await runner.cleanup()
         task.cancel()
+        ttask.cancel()
         await http.close()
         await db.close()
 
@@ -968,78 +1056,3 @@ BANNER_B64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODw
 
 if __name__ == "__main__":
     asyncio.run(main())
-async def get_traffic_report():
-    services = await cached("/catalog/services", ttl=600)
-    google_svc = next((s for s in services if any(k in s["name"].lower() for k in ["google", "youtube", "gmail"])), None)
-    wa_svc = next((s for s in services if "whatsapp" in s["name"].lower()), None)
-    other_candidates = [s for s in services if s.get("active") and s != google_svc and s != wa_svc]
-    other_svc = other_candidates[0] if other_candidates else None
-
-    target_svcs = [
-        ("1️⃣ Google / YouTube / Gmail", google_svc),
-        ("2️⃣ WhatsApp", wa_svc),
-        (f"3️⃣ {other_svc['name'] if other_svc else 'Telegram'}", other_svc)
-    ]
-
-    report_text = "🔥 <b>REKOMENDASI TRAFIK & STOK TERBAIK HARI INI</b>\n" + LINE + "\n"
-    report_text += "<i>Referensi negara & operator dengan stok dan penerimaan OTP paling stabil.</i>\n\n"
-
-    for label, svc in target_svcs:
-        if not svc: continue
-        sid = svc["id"]
-        report_text += f"<b>{label}</b>\n"
-        products = await cached("/catalog/products", {"platform_id": sid, "sort": "available_desc", "limit": 100}, ttl=60)
-        countries_map = {c["id"]: c for c in await cached("/catalog/countries", ttl=600)}
-        country_stocks = {}
-        for p in products:
-            if not (p.get("active") and p.get("available", 0) > 0): continue
-            cid = p["country_id"]
-            country_stocks.setdefault(cid, []).append(p)
-        sorted_countries = sorted(country_stocks.items(), key=lambda x: sum(item['available'] for item in x[1]), reverse=True)[:3]
-        if not sorted_countries:
-            report_text += "└ <i>Stok sedang kosong</i>\n\n"
-            continue
-        for i, (cid, offers_list) in enumerate(sorted_countries, 1):
-            c_info = countries_map.get(cid, {})
-            flag, c_name = c_info.get("emoji", "🌍"), c_info.get("name", "Unknown")
-            best_offer = min(offers_list, key=lambda x: x.get("price", 0))
-            op_name = best_offer.get("operator_name") or "Semua Operator (Any)"
-            total_stock = sum(item['available'] for item in offers_list)
-            price_sell = sell_price(best_offer["price"], c_info)
-            report_text += f"   {i}. {flag} <b>{c_name}</b>\n      • Operator: <code>{esc(op_name)}</code>\n      • Harga: <b>{rp(price_sell)}</b> (Stok: {total_stock})\n"
-        report_text += "\n"
-    report_text += "🛒 <i>Yuk langsung amankan nomornya di bot sebelum kehabisan!</i>"
-    return report_text
-
-async def traffic_poller(bot: Bot):
-    while True:
-        try:
-            await asyncio.sleep(10800) # Tiap 3 jam
-            target_chan = CHANNEL2_ID or CHANNEL_ID
-            if target_chan:
-                text = await get_traffic_report()
-                await bot.send_message(target_chan, text)
-                log.info("Laporan trafik otomatis berhasil dikirim ke channel.")
-        except Exception as e:
-            log.warning("Gagal mengirim laporan trafik otomatis: %s", e)
-        await asyncio.sleep(60)
-
-@r.message(Command("trafik"))
-async def cmd_trafik(m: Message, bot: Bot):
-    if m.from_user.id not in ADMINS: return
-    loading = await m.answer("🔍 Menganalisis data trafik <i>real-time</i>...")
-    text = await get_traffic_report()
-    await loading.edit_text(text, reply_markup=kb([[b("📡 Kirim ke Channel", "send_chan")]]))
-
-@r.callback_query(F.data == "send_chan")
-async def send_chan_callback(cb: CallbackQuery, bot: Bot):
-    if cb.from_user.id not in ADMINS: return await cb.answer("Khusus admin.", show_alert=True)
-    target_chan = CHANNEL2_ID or CHANNEL_ID
-    if not target_chan:
-        return await cb.answer("CHANNEL_ID belum disetel!", show_alert=True)
-    try:
-        text = await get_traffic_report()
-        await bot.send_message(target_chan, text)
-        await cb.answer("✅ Berhasil dikirim ke channel!", show_alert=True)
-    except Exception as e:
-        await cb.answer(f"Gagal kirim: {e}", show_alert=True)
