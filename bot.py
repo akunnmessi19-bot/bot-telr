@@ -305,8 +305,10 @@ def card(o):
          f"{STATUS[o['status']]}")
     if o.get("otp"):
         t += f"\n\n{LINE}\n" + sms_text(o)
+    if o["status"] in ("ACTIVE", "OTP"):
+        t += "\n\n💡 <i>Catatan: Jika OTP sudah masuk, jangan langsung klik <b>✅ Selesai / Batal</b> karena kode bisa keluar lebih dari 1 kali kalo lagi hoki.</i>"
     return t
-
+  
 def card_kb(o):
     i = o["id"]
     if o["status"] in ("ACTIVE", "OTP"):
@@ -501,7 +503,8 @@ async def place_order(cb: CallbackQuery, bot: Bot, sid, cid, oid, pid, shown=Non
         return
     uid = cb.from_user.id
     c, svc = await country_of(cid), await svc_name(sid)
-    p = next((x for x in await offers(sid, cid, oid) if str(x["id"]) == str(pid)), None)
+    available_offers = await offers(sid, cid, oid)
+    p = (available_offers[0] if available_offers else None) if pid is None else next((x for x in available_offers if str(x["id"]) == str(pid)), None)
     if not p:
         await bot.send_message(cb.message.chat.id, "😕 Stok habis. Daftar nomor di atas tetap tersedia.")
         return
