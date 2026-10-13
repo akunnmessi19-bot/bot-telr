@@ -16,17 +16,22 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, FSInputFile, Inline
                            InlineKeyboardMarkup, Message)
 
 load_dotenv()
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-SMS_TOKEN = os.environ["SMSCODE_TOKEN"]
+try:
+    BOT_TOKEN = os.environ["BOT_TOKEN"]
+    SMS_TOKEN = os.environ["SMSCODE_TOKEN"]
+except KeyError as e:
+    raise SystemExit(f"Variabel {e} belum diisi (BOT_TOKEN & SMSCODE_TOKEN wajib ada di .env / Variables).")
 ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 MARKUP = float(os.getenv("MARKUP_PERCENT", "30"))
 STORE = os.getenv("STORE_NAME", "OTP Store")
 PAY_INFO = os.getenv("PAYMENT_INFO", "Hubungi admin untuk metode pembayaran.").replace("\\n", "\n")
-MIN_DEP = int(os.getenv("MIN_DEPOSIT", "5000"))
+MIN_DEP = int(os.getenv("MIN_DEPOSIT", "2000"))
 AUTO_CANCEL = int(os.getenv("AUTO_CANCEL_MIN", "10")) * 60
 KASERA_KEY = os.getenv("KASERA_API_KEY", "")          # kp_test_... atau kp_live_...
 WH_SECRET = os.getenv("KASERA_WEBHOOK_SECRET", "")    # signing secret endpoint webhook
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT") or os.getenv("PORT") or 8080)   # Railway otomatis mengisi PORT
+FEE_PCT_BPS = round(float(os.getenv("KASERA_FEE_PERCENT", "0.7")) * 100)     # QRIS Kasera 0,7% (dalam basis poin)
+FEE_FIXED = int(os.getenv("KASERA_FEE_FIXED", "250"))                        # QRIS Kasera + Rp250
 LIVE = KASERA_KEY.startswith("kp_live_")
 API = "https://api.smscode.gg/v1"
 LINE = "<code>────────────────────</code>"
@@ -113,7 +118,7 @@ async def init_db():
     """)
     for tbl, col in [("deposits", "kasera_id TEXT"), ("orders", "sid INTEGER"), ("orders", "cid INTEGER"), ("orders", "oid INTEGER"),
                      ("orders", "svc TEXT"), ("orders", "ctry TEXT"), ("orders", "code TEXT"), ("orders", "msg TEXT"),
-                     ("orders", "ph INTEGER")]:
+                     ("orders", "ph INTEGER"), ("orders", "opn TEXT")]:
         try:
             await db.execute(f"ALTER TABLE {tbl} ADD COLUMN {col}")
         except Exception:
@@ -186,6 +191,14 @@ async def sr_stats(sid):
                        "WHERE sid=? AND cid IS NOT NULL AND created>? AND (status!='ACTIVE' OR created<?) GROUP BY cid",
                        (int(sid), time.time() - 14 * 86400, time.time() - AUTO_CANCEL))
     return {x["cid"]: round(100 * (x["s"] or 0) / x["n"]) for x in rows if x["n"] >= SR_MIN}
+
+async def op_sr_stats(sid):
+    """Success rate per (negara, operator) dari transaksi toko sendiri, 14 hari terakhir."""
+    rows = await fetch("SELECT cid, opn, COUNT(*) n, SUM(CASE WHEN otp IS NOT NULL THEN 1 ELSE 0 END) s FROM orders "
+                       "WHERE sid=? AND cid IS NOT NULL AND opn IS NOT NULL AND opn!='' AND created>? "
+                       "AND (status!='ACTIVE' OR created<?) GROUP BY cid, opn",
+                       (int(sid), time.time() - 14 * 86400, time.time() - AUTO_CANCEL))
+    return {(x["cid"], x["opn"]): round(100 * (x["s"] or 0) / x["n"]) for x in rows if x["n"] >= SR_MIN}
 
 async def svc_name(sid):
     return next((s["name"] for s in await cached("/catalog/services", ttl=600) if str(s["id"]) == str(sid)), "Layanan")
@@ -364,6 +377,7 @@ async def home_new(cb: CallbackQuery):
 
 @r.callback_query(F.data == "me")
 async def me(cb: CallbackQuery):
+    await cb.answer()
     bal = await balance(cb.from_user.id, cb.from_user.full_name)
     n = (await one("SELECT COUNT(*) c FROM orders WHERE user_id=?", (cb.from_user.id,)))["c"]
     await show(cb, f"👤 <b>AKUN SAYA</b>\n{LINE}\n<blockquote>🆔 ID  <code>{cb.from_user.id}</code>\n"
@@ -372,12 +386,14 @@ async def me(cb: CallbackQuery):
 
 @r.callback_query(F.data == "hist")
 async def hist(cb: CallbackQuery):
+    await cb.answer()
     rows = await fetch("SELECT * FROM orders WHERE user_id=? ORDER BY created DESC LIMIT 8", (cb.from_user.id,))
     body = "\n".join(f"{EMOJI[o['status']]} <b>#{o['id']}</b> · {esc(o['label'])} · {rp(o['price'])}" for o in rows) or "<i>Belum ada pesanan.</i>"
     await show(cb, f"📜 <b>RIWAYAT PESANAN</b>\n{LINE}\n<blockquote>{body}</blockquote>", kb([[b("🏠 Menu Utama", "home")]]))
 
 @r.callback_query(F.data == "help")
 async def help_(cb: CallbackQuery):
+    await cb.answer()
     await show(cb, f"🛟 <b>BANTUAN</b>\n{LINE}\n<blockquote>1️⃣ Top up saldo\n2️⃣ Pilih layanan &amp; negara\n"
                    f"3️⃣ Gunakan nomor di aplikasi tujuan\n4️⃣ Kode OTP muncul otomatis di sini</blockquote>\n"
                    f"♻️ <i>OTP tidak masuk? Pesanan dibatalkan otomatis dan saldo kembali.</i>",
@@ -546,10 +562,10 @@ async def place_order(cb: CallbackQuery, bot: Bot, sid, cid, oid, pid, shown=Non
         log.exception("kirim kartu nomor sebagai teks gagal")
 
     msg_id = sent.message_id if sent else 0
-    await db.execute("INSERT INTO orders(id,user_id,label,phone,price,status,chat_id,msg_id,created,sid,cid,oid,svc,ctry,ph)"
-                     " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    await db.execute("INSERT INTO orders(id,user_id,label,phone,price,status,chat_id,msg_id,created,sid,cid,oid,svc,ctry,ph,opn)"
+                     " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                      (o_["id"], uid, label, o_["phone_number"], price, "ACTIVE", cb.message.chat.id, msg_id,
-                      time.time(), int(sid), int(cid), int(oid), svc, c.get("name", ""), is_photo))
+                      time.time(), int(sid), int(cid), int(oid), svc, c.get("name", ""), is_photo, p.get("operator_name") or ""))
     await db.commit()
 
 
@@ -627,6 +643,7 @@ class Dep(StatesGroup):
 
 @r.callback_query(F.data == "dep")
 async def dep(cb: CallbackQuery):
+    await cb.answer()
     amts = [10000, 20000, 50000, 100000]
     rows = [[b("💳 " + rp(a), f"dp:{a}") for a in amts[:2]], [b("💳 " + rp(a), f"dp:{a}") for a in amts[2:]],
             [b("✏️ Nominal Lain", "dpx")], [b("🏠 Menu Utama", "home")]]
@@ -634,6 +651,7 @@ async def dep(cb: CallbackQuery):
 
 @r.callback_query(F.data == "dpx")
 async def dpx(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
     await state.set_state(Dep.amount)
     await show(cb, f"✏️ Ketik nominal deposit (angka saja, min. {rp(MIN_DEP)}):")
 
@@ -643,7 +661,7 @@ async def dep_amount(m: Message, state: FSMContext):
     if not txt.isdigit() or int(txt) < MIN_DEP:
         return await m.answer(f"Nominal tidak valid. Minimal {rp(MIN_DEP)}.")
     await state.clear()
-    await send_invoice(m, m.from_user.id, int(txt))
+    await ask_deposit(m, m.from_user.id, int(txt))
 
 async def send_invoice(target, uid, amount):
     if KASERA_KEY:
@@ -664,7 +682,36 @@ async def send_invoice(target, uid, amount):
 @r.callback_query(F.data.startswith("dp:"))
 async def dp(cb: CallbackQuery):
     await cb.answer()
-    await send_invoice(cb, cb.from_user.id, int(cb.data.split(":")[1]))
+    await ask_deposit(cb, cb.from_user.id, int(cb.data.split(":")[1]))
+
+async def ask_deposit(target, uid, amount):
+    """Tampilkan rincian top up (biaya admin Kasera ditanggung pembeli) lalu minta konfirmasi."""
+    msg = target.message if isinstance(target, CallbackQuery) else target
+    if amount < MIN_DEP:
+        return await msg.answer(f"⚠️ Minimal top up adalah {rp(MIN_DEP)}.")
+    if not KASERA_KEY:  # mode manual: tanpa biaya admin Kasera
+        return await send_invoice(target, uid, amount)
+    q = hitung_tagihan_kasera(amount, "QRIS")
+    await msg.answer(
+        f"📝 <b>KONFIRMASI TOP UP SALDO</b>\n{LINE}\n"
+        f"<blockquote>💰 Saldo masuk  <b>{rp(q['nominal_saldo'])}</b>\n"
+        f"🧾 Biaya admin  <b>{rp(q['biaya_admin'])}</b>\n📲 Metode  <b>QRIS</b></blockquote>\n"
+        f"💳 <b>Total bayar: {rp(q['total_bayar'])}</b>\n\n"
+        f"<i>Biaya admin ditanggung pembeli, saldo yang masuk utuh {rp(q['nominal_saldo'])}.</i>",
+        reply_markup=kb([[b(f"✅ Bayar {rp(q['total_bayar'])}", f"dpc:{amount}")],
+                         [b("‹ Ganti Nominal", "dep"), b("🏠 Menu", "hm")]]))
+
+@r.callback_query(F.data.startswith("dpc:"))
+async def dp_confirm(cb: CallbackQuery):
+    await cb.answer()
+    amount = int(cb.data.split(":")[1])
+    if amount < MIN_DEP:
+        return
+    try:  # hapus tombol agar tidak terbuat dua invoice karena klik ganda
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await send_invoice(cb, cb.from_user.id, amount)
 
 @r.callback_query(F.data.startswith("paid:"))
 async def paid(cb: CallbackQuery, bot: Bot):
@@ -711,20 +758,37 @@ def qr_png(data):
     qrcode.make(data).save(buf, format="PNG")
     return buf.getvalue()
 
+FEE_RULES = {"QRIS": (FEE_PCT_BPS, FEE_FIXED), "VA": (0, 5000)}   # (persen dalam basis poin, biaya tetap Rp)
+
+def _ceil_div(a, b): return -(-a // b)
+
+def hitung_tagihan_kasera(nominal_bersih: int, metode: str = "QRIS") -> dict:
+    """Gross-up: total yang dibayar pembeli agar saldo bersih yang masuk pas sesuai nominal.
+    Pakai aritmetika bilangan bulat (tanpa float) supaya tidak ada selisih pembulatan."""
+    bps, fixed = FEE_RULES.get(metode.upper(), (0, 0))
+    nominal = int(nominal_bersih)
+    total = _ceil_div((nominal + fixed) * 10000, 10000 - bps)
+    fee_kasera = _ceil_div(total * bps, 10000) + fixed       # biaya yang dipotong Kasera dari total
+    return {"nominal_saldo": nominal, "total_bayar": total, "biaya_admin": total - nominal,
+            "fee_kasera": fee_kasera, "diterima_kamu": total - fee_kasera}
+
 async def kasera_invoice(target, uid, amount):
     msg = target.message if isinstance(target, CallbackQuery) else target
-    cur = await db.execute("INSERT INTO deposits(user_id,amount,total,created) VALUES(?,?,?,?)", (uid, amount, amount, time.time()))
+    q = hitung_tagihan_kasera(amount, "QRIS")
+    total = q["total_bayar"]
+    cur = await db.execute("INSERT INTO deposits(user_id,amount,total,created) VALUES(?,?,?,?)", (uid, amount, total, time.time()))
     await db.commit()
     did = cur.lastrowid
     tx, err = await kasera("POST", "/v1/transactions", headers={"Idempotency-Key": f"dep{did}"},
-                           json={"amount": amount, "payment_methods": ["qris"], "external_id": f"dep{did}",
+                           json={"amount": total, "payment_methods": ["qris"], "external_id": f"dep{did}",
                                  "description": f"Deposit #{did}", "expires_in_minutes": 30})
     if err:
         await run("UPDATE deposits SET status='FAILED' WHERE id=?", (did,))
         return await msg.answer("😕 Gagal membuat invoice, coba lagi sebentar lagi.")
     await run("UPDATE deposits SET kasera_id=? WHERE id=?", (tx["id"], did))
     text = (f"🧾 <b>INVOICE TOP UP #{did}</b>\n{LINE}\n"
-            f"<blockquote>💰 Nominal  <b>{rp(amount)}</b>\n📲 Metode  <b>QRIS</b>\n⏱ Berlaku  <b>30 menit</b></blockquote>\n"
+            f"<blockquote>💰 Saldo masuk  <b>{rp(amount)}</b>\n🧾 Biaya admin  <b>{rp(q['biaya_admin'])}</b>\n"
+            f"💳 Total bayar  <b>{rp(total)}</b>\n📲 Metode  <b>QRIS</b>\n⏱ Berlaku  <b>30 menit</b></blockquote>\n"
             f"Scan QR di atas, saldo masuk <b>otomatis</b> setelah bayar ✅")
     markup = kb([[InlineKeyboardButton(text="🌐 Buka Halaman Bayar", url=tx["checkout_url"])], [b("🏠 Menu", "hm")]])
     qr = (tx.get("payment") or {}).get("qr_string")
@@ -736,7 +800,7 @@ async def kasera_invoice(target, uid, amount):
 async def settle(bot: Bot, did, paid_amount=None):
     """Tambahkan saldo untuk deposit yang lunas, tepat satu kali."""
     d = await one("SELECT * FROM deposits WHERE id=?", (did,))
-    if not d or (paid_amount is not None and int(paid_amount) != d["amount"]):
+    if not d or (paid_amount is not None and int(paid_amount) not in (d["total"], d["amount"])):
         log.warning("Deposit %s tidak cocok / tidak ditemukan", did)
         return False
     if await run("UPDATE deposits SET status='OK' WHERE id=? AND status IN ('PENDING','EXPIRED')", (did,)) == 0:
@@ -929,53 +993,117 @@ async def poller(bot: Bot):
 
 
 # ---------- laporan trafik (/trafik + kirim otomatis ke channel) ----------
+# Fokus: nomor TERMURAH dengan success rate (SR) TINGGI untuk Google/YouTube/Gmail, WhatsApp, Telegram.
+# Negara diurutkan sesuai prioritas PRIO_COUNTRIES (PH -> ID -> BR -> CL -> ZA), operator ikut ditampilkan.
 TRAFFIC_EVERY = 3 * 3600  # kirim otomatis tiap 3 jam
+TRAFFIC_SERVICES = [("1️⃣ Google / YouTube / Gmail", ("google", "gmail", "youtube")),
+                    ("2️⃣ WhatsApp", ("whatsapp",)),
+                    ("3️⃣ Telegram", ("telegram",))]
+TRAFFIC_OPS = 2   # jumlah operator termurah yang ditampilkan per negara
+GOOD_SR = 50      # SR minimal (%) agar negara/operator dianggap stabil
 
 
 def pick_services(services):
-    """Pilih 3 layanan: Google/YouTube/Gmail, WhatsApp, dan satu layanan populer lain yang aktif."""
-    active = [s for s in services if s.get("active")]
-    google = next((s for s in active if any(k in s["name"].lower() for k in ("google", "youtube", "gmail"))), None)
-    wa = next((s for s in active if "whatsapp" in s["name"].lower()), None)
-    other = None
-    for key in PRIORITY:  # urutan populer yang sudah ada di bot
-        other = next((s for s in active if key in s["name"].lower() and s is not google and s is not wa), None)
-        if other: break
-    if not other:
-        other = next((s for s in active if s is not google and s is not wa), None)
-    return [("1️⃣ Google / YouTube / Gmail", google), ("2️⃣ WhatsApp", wa),
-            (f"3️⃣ {other['name']}" if other else "3️⃣ Lainnya", other)]
+    """Cari layanan Google/YouTube/Gmail, WhatsApp, dan Telegram di katalog (yang aktif)."""
+    active = [s_ for s_ in services if s_.get("active")]
+    out = []
+    for label, keys in TRAFFIC_SERVICES:
+        svc = None
+        for key in keys:
+            svc = next((s_ for s_ in active if key in s_["name"].lower()), None)
+            if svc: break
+        out.append((label, svc))
+    return out
+
+
+def split_msg(text, limit=3900):
+    """Pecah teks panjang per blok agar tidak melewati batas 4096 karakter Telegram."""
+    parts, cur = [], ""
+    for blk in text.split("\n\n"):
+        if cur and len(cur) + 2 + len(blk) > limit:
+            parts.append(cur)
+            cur = blk
+        else:
+            cur = f"{cur}\n\n{blk}" if cur else blk
+    if cur: parts.append(cur)
+    return parts
+
+
+async def send_long(bot: Bot, chat_id, text, markup=None):
+    parts = split_msg(text)
+    for i, part in enumerate(parts):
+        await bot.send_message(chat_id, part, reply_markup=markup if i == len(parts) - 1 else None)
+
+
+def sr_label(s_):
+    return "SR baru" if s_ is None else f"SR {s_}%" + (" 🔥" if s_ >= 60 else "")
+
+
+async def traffic_block(label, svc, by_code):
+    if not svc:
+        return f"<b>{esc(label)}</b>\n└ <i>Layanan tidak ditemukan di katalog</i>"
+    sid = svc["id"]
+    products = await cached("/catalog/products", {"platform_id": sid, "sort": "price_asc", "limit": 10000}, ttl=60)
+    stock = {}
+    for p in products:
+        if p.get("active") and p.get("available", 0) > 0:
+            stock.setdefault(p["country_id"], []).append(p)
+    csr, osr = await sr_stats(sid), await op_sr_stats(sid)
+    lines, best = "", []
+    for code in PRIO_COUNTRIES:
+        c = by_code.get(code)
+        if not c: continue
+        flag, name = c.get("emoji", "🌍"), esc(c.get("name", code))
+        offs = stock.get(c["id"])
+        if not offs:
+            lines += f"🔴 {flag} <b>{name}</b> — stok habis\n"
+            continue
+        cs = csr.get(c["id"])
+        ops = {}  # operator -> harga modal termurah + total stok
+        for p in offs:
+            nm = p.get("operator_name") or "Any"
+            o = ops.setdefault(nm, {"price": p["price"], "stock": 0})
+            o["price"] = min(o["price"], p["price"])
+            o["stock"] += p["available"]
+
+        def op_sr(nm):  # SR operator; jika datanya belum cukup, pakai SR negara
+            v = osr.get((c["id"], nm))
+            return cs if v is None else v
+
+        def rank(item):  # operator stabil dulu, lalu termurah
+            sr_ = op_sr(item[0])
+            return (0 if sr_ is None or sr_ >= GOOD_SR else 1, item[1]["price"], item[0])
+
+        ranked = sorted(ops.items(), key=rank)
+        emo = "🟢" if cs is None or cs >= GOOD_SR else "🟡" if cs >= 20 else "🔴"
+        lines += f"{emo} {flag} <b>{name}</b> · {sr_label(cs)} · stok {sum(o['stock'] for o in ops.values())}\n"
+        for nm, o in ranked[:TRAFFIC_OPS]:
+            v = osr.get((c["id"], nm))
+            lines += (f"   📡 <code>{esc(nm)}</code> · <b>{rp(sell_price(o['price'], c))}</b>"
+                      f"{'' if v is None else f' · SR {v}%'} · stok {o['stock']}\n")
+        top_nm, top = ranked[0]
+        if rank(ranked[0])[0] == 0 and (cs is None or cs >= GOOD_SR):
+            best.append((sell_price(top["price"], c), PRIO_COUNTRIES.index(code), flag, name, top_nm))
+    head = f"<b>{esc(label)}</b>\n"
+    if best:
+        price, _, flag, name, nm = min(best)
+        head += f"🏆 <i>Paling hemat &amp; stabil:</i> {flag} <b>{name}</b> · <code>{esc(nm)}</code> · <b>{rp(price)}</b>\n"
+    return head + (lines or "└ <i>Negara prioritas belum tersedia di katalog</i>\n").rstrip("\n")
 
 
 async def get_traffic_report():
     services = await cached("/catalog/services", ttl=600)
     if not services:
         return "⚠️ Data katalog belum bisa diambil dari API. Coba lagi sebentar."
-    countries_map = {c["id"]: c for c in await cached("/catalog/countries", ttl=600)}
-    text = "🔥 <b>REKOMENDASI TRAFIK & STOK TERBAIK HARI INI</b>\n" + LINE + "\n"
-    text += "<i>Referensi negara & operator dengan stok dan penerimaan OTP paling stabil.</i>\n\n"
+    by_code = {str(c.get("code", "")).upper(): c for c in await cached("/catalog/countries", ttl=600) if c.get("active")}
+    blocks = ["🔥 <b>REKOMENDASI TRAFIK OTP · TERMURAH &amp; STABIL</b>\n" + LINE + "\n"
+              "<i>Prioritas negara: PH → ID → BR → CL → ZA. Operator diurutkan yang stabil &amp; termurah dulu.\n"
+              "SR = persentase OTP masuk dari transaksi toko (14 hari terakhir).\n"
+              "🟢 bagus · 🟡 sedang · 🔴 rendah/habis</i>"]
     for label, svc in pick_services(services):
-        if not svc: continue
-        text += f"<b>{esc(label)}</b>\n"
-        products = await cached("/catalog/products", {"platform_id": svc["id"], "sort": "available_desc", "limit": 100}, ttl=60)
-        by_country = {}
-        for p in products:
-            if p.get("active") and p.get("available", 0) > 0:
-                by_country.setdefault(p["country_id"], []).append(p)
-        top = sorted(by_country.items(), key=lambda x: sum(i["available"] for i in x[1]), reverse=True)[:3]
-        if not top:
-            text += "└ <i>Stok sedang kosong</i>\n\n"
-            continue
-        for n, (cid, offs) in enumerate(top, 1):
-            c = countries_map.get(cid, {})
-            best = min(offs, key=lambda x: x.get("price", 0))
-            op = best.get("operator_name") or "Semua Operator (Any)"
-            stock = sum(i["available"] for i in offs)
-            text += (f"   {n}. {c.get('emoji', '🌍')} <b>{esc(c.get('name', 'Unknown'))}</b>\n"
-                     f"      • Operator: <code>{esc(op)}</code>\n"
-                     f"      • Harga: <b>{rp(sell_price(best['price'], c))}</b> (Stok: {stock})\n")
-        text += "\n"
-    return text + "🛒 <i>Yuk langsung amankan nomornya di bot sebelum kehabisan!</i>"
+        blocks.append(await traffic_block(label, svc, by_code))
+    blocks.append("🛒 <i>Yuk langsung amankan nomornya di bot sebelum kehabisan!</i>")
+    return "\n\n".join(blocks)
 
 
 async def traffic_poller(bot: Bot):
@@ -984,7 +1112,7 @@ async def traffic_poller(bot: Bot):
         await asyncio.sleep(TRAFFIC_EVERY)
         if not CHANNEL_ID: continue
         try:
-            await bot.send_message(CHANNEL_ID, await get_traffic_report())
+            await send_long(bot, CHANNEL_ID, await get_traffic_report())
             log.info("Laporan trafik otomatis terkirim ke channel.")
         except Exception as e:
             log.warning("Gagal kirim laporan trafik otomatis: %s", e)
@@ -995,11 +1123,14 @@ async def cmd_trafik(m: Message):
     if m.from_user.id not in ADMINS: return
     loading = await m.answer("🔍 Menganalisis data trafik <i>real-time</i>...")
     try:
-        text = await get_traffic_report()
+        parts = split_msg(await get_traffic_report())
     except Exception as e:
         log.exception("trafik gagal")
         return await loading.edit_text(f"❌ Gagal membuat laporan: {esc(e)}")
-    await loading.edit_text(text, reply_markup=kb([[b("📡 Kirim ke Channel", "send_chan")]]))
+    markup = kb([[b("📡 Kirim ke Channel", "send_chan")]])
+    await loading.edit_text(parts[0], reply_markup=markup if len(parts) == 1 else None)
+    for i, part in enumerate(parts[1:], 1):
+        await m.answer(part, reply_markup=markup if i == len(parts) - 1 else None)
 
 
 @r.callback_query(F.data == "send_chan")
@@ -1008,7 +1139,7 @@ async def send_chan_callback(cb: CallbackQuery, bot: Bot):
     if not CHANNEL_ID:
         return await cb.answer("CHANNEL_ID belum diisi di Variables Railway!", show_alert=True)
     try:
-        await bot.send_message(CHANNEL_ID, await get_traffic_report())
+        await send_long(bot, CHANNEL_ID, await get_traffic_report())
         await cb.answer("✅ Berhasil dikirim ke channel!", show_alert=True)
     except Exception as e:
         await cb.answer(f"Gagal kirim: {e}"[:190], show_alert=True)
