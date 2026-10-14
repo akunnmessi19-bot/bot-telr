@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -115,10 +115,11 @@ async def init_db():
         created REAL, refunded INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS deposits(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
         amount INTEGER, total INTEGER, status TEXT DEFAULT 'PENDING', created REAL);
+    CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
     """)
     for tbl, col in [("deposits", "kasera_id TEXT"), ("orders", "sid INTEGER"), ("orders", "cid INTEGER"), ("orders", "oid INTEGER"),
                      ("orders", "svc TEXT"), ("orders", "ctry TEXT"), ("orders", "code TEXT"), ("orders", "msg TEXT"),
-                     ("orders", "ph INTEGER"), ("orders", "opn TEXT")]:
+                     ("orders", "ph INTEGER")]:
         try:
             await db.execute(f"ALTER TABLE {tbl} ADD COLUMN {col}")
         except Exception:
@@ -191,14 +192,6 @@ async def sr_stats(sid):
                        "WHERE sid=? AND cid IS NOT NULL AND created>? AND (status!='ACTIVE' OR created<?) GROUP BY cid",
                        (int(sid), time.time() - 14 * 86400, time.time() - AUTO_CANCEL))
     return {x["cid"]: round(100 * (x["s"] or 0) / x["n"]) for x in rows if x["n"] >= SR_MIN}
-
-async def op_sr_stats(sid):
-    """Success rate per (negara, operator) dari transaksi toko sendiri, 14 hari terakhir."""
-    rows = await fetch("SELECT cid, opn, COUNT(*) n, SUM(CASE WHEN otp IS NOT NULL THEN 1 ELSE 0 END) s FROM orders "
-                       "WHERE sid=? AND cid IS NOT NULL AND opn IS NOT NULL AND opn!='' AND created>? "
-                       "AND (status!='ACTIVE' OR created<?) GROUP BY cid, opn",
-                       (int(sid), time.time() - 14 * 86400, time.time() - AUTO_CANCEL))
-    return {(x["cid"], x["opn"]): round(100 * (x["s"] or 0) / x["n"]) for x in rows if x["n"] >= SR_MIN}
 
 async def svc_name(sid):
     return next((s["name"] for s in await cached("/catalog/services", ttl=600) if str(s["id"]) == str(sid)), "Layanan")
@@ -562,10 +555,10 @@ async def place_order(cb: CallbackQuery, bot: Bot, sid, cid, oid, pid, shown=Non
         log.exception("kirim kartu nomor sebagai teks gagal")
 
     msg_id = sent.message_id if sent else 0
-    await db.execute("INSERT INTO orders(id,user_id,label,phone,price,status,chat_id,msg_id,created,sid,cid,oid,svc,ctry,ph,opn)"
-                     " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    await db.execute("INSERT INTO orders(id,user_id,label,phone,price,status,chat_id,msg_id,created,sid,cid,oid,svc,ctry,ph)"
+                     " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                      (o_["id"], uid, label, o_["phone_number"], price, "ACTIVE", cb.message.chat.id, msg_id,
-                      time.time(), int(sid), int(cid), int(oid), svc, c.get("name", ""), is_photo, p.get("operator_name") or ""))
+                      time.time(), int(sid), int(cid), int(oid), svc, c.get("name", ""), is_photo))
     await db.commit()
 
 
@@ -858,7 +851,7 @@ async def admin(m: Message):
     o = await one("SELECT COUNT(*) c, COALESCE(SUM(price),0) s FROM orders WHERE refunded=0")
     await m.answer(f"🛠 <b>Admin</b>\n{LINE}\n👥 User: {u}\n🧾 Order sukses/aktif: {o['c']}\n💵 Omzet: {rp(o['s'])}\n"
                    f"🏦 Saldo SMSCode: {rp(d['balance']) if d else 'n/a'}\n\n"
-                   f"/addsaldo &lt;user_id&gt; &lt;nominal&gt;\n/broadcast &lt;pesan&gt;\n/testchannel")
+                   f"/addsaldo &lt;user_id&gt; &lt;nominal&gt;\n/broadcast &lt;pesan&gt; (manual ke user)\n/trafik (laporan trafik, HANYA ke channel)\n/autobroadcast (promosi harga termurah, HANYA ke user)\n/testchannel")
 
 @r.message(Command("addsaldo"))
 async def addsaldo(m: Message):
@@ -992,27 +985,57 @@ async def poller(bot: Bot):
         await asyncio.sleep(4)
 
 
-# ---------- laporan trafik (/trafik + kirim otomatis ke channel) ----------
-# Fokus: nomor TERMURAH dengan success rate (SR) TINGGI untuk Google/YouTube/Gmail, WhatsApp, Telegram.
-# Negara diurutkan sesuai prioritas PRIO_COUNTRIES (PH -> ID -> BR -> CL -> ZA), operator ikut ditampilkan.
-TRAFFIC_EVERY = 3 * 3600  # kirim otomatis tiap 3 jam
-TRAFFIC_SERVICES = [("1️⃣ Google / YouTube / Gmail", ("google", "gmail", "youtube")),
-                    ("2️⃣ WhatsApp", ("whatsapp",)),
-                    ("3️⃣ Telegram", ("telegram",))]
-TRAFFIC_OPS = 2   # jumlah operator termurah yang ditampilkan per negara
-GOOD_SR = 50      # SR minimal (%) agar negara/operator dianggap stabil
+# ---------- trafik (channel) & promosi (user): DUA alur terpisah ----------
+# 1) LAPORAN TRAFIK  -> hanya ke CHANNEL. Perintah admin: /trafik (tombol "Kirim ke Channel") + jadwal otomatis TRAFFIC_TIMES.
+# 2) PROMOSI         -> hanya ke USER bot. Perintah admin: /autobroadcast + jadwal otomatis PROMO_TIMES.
+# Sumber data (bukan data toko):
+#  - API SMSCode (provider bot ini): harga, stok, dan operator real-time per negara & layanan.
+#  - API publik web (tanpa API key): success rate (SR) pasar per negara & layanan.
+#    API SMSCode tidak membuka angka SR di katalognya, jadi SR diambil dari API publik 5sim.
+#    Matikan dengan env MARKET_SR=0 (laporan tetap jalan, hanya tanpa angka SR).
+# Negara diurutkan sesuai PRIO_COUNTRIES (PH -> ID -> BR -> CL -> ZA), operator ikut ditampilkan.
+SR_API = os.getenv("SR_API_URL", "https://5sim.net/v1/guest/prices")
+MARKET_SR = os.getenv("MARKET_SR", "1") != "0"
+SR_SLUGS = {"PH": ("philippines",), "ID": ("indonesia",), "BR": ("brazil",),
+            "CL": ("chile",), "ZA": ("southafrica", "south_africa")}          # kode negara -> slug API SR
+TRAFFIC_SERVICES = [("1️⃣ Google / YouTube / Gmail", ("google", "gmail", "youtube"), "google"),
+                    ("2️⃣ WhatsApp", ("whatsapp",), "whatsapp"),
+                    ("3️⃣ Telegram", ("telegram",), "telegram")]              # (label, kata kunci katalog, slug API SR)
+TRAFFIC_OPS = 2          # jumlah operator termurah yang ditampilkan per negara
+TRAFFIC_MIN_STOCK = 5    # stok minimal agar operator/negara dianggap stabil
+GOOD_SR = 50             # SR minimal (%) agar negara dianggap stabil
+PROMO_COUNTRIES = ["PH", "BR", "CL", "ID"]   # negara di pesan promosi ke user (ditampilkan termurah dulu)
+
+BROADCAST_TZ = int(os.getenv("BROADCAST_TZ", "7"))                   # jam dari UTC (WIB = 7)
+
+
+def _parse_slots(raw, default):
+    out = set()
+    for t in str(raw).split(","):
+        try:
+            hh, mm = t.strip().split(":")
+            if 0 <= int(hh) < 24 and 0 <= int(mm) < 60:
+                out.add((int(hh), int(mm)))
+        except ValueError:
+            continue
+    return sorted(out) or default
+
+
+# Jadwal otomatis (masing-masing 3x sehari). Ubah lewat env, contoh TRAFFIC_TIMES=07:30,13:00,19:30
+TRAFFIC_SLOTS = _parse_slots(os.getenv("TRAFFIC_TIMES", "08:00,14:00,20:00"), [(8, 0), (14, 0), (20, 0)])  # -> channel
+PROMO_SLOTS = _parse_slots(os.getenv("PROMO_TIMES", "09:00,15:00,21:00"), [(9, 0), (15, 0), (21, 0)])      # -> user
 
 
 def pick_services(services):
-    """Cari layanan Google/YouTube/Gmail, WhatsApp, dan Telegram di katalog (yang aktif)."""
+    """Cari Google/YouTube/Gmail, WhatsApp, dan Telegram di katalog (yang aktif)."""
     active = [s_ for s_ in services if s_.get("active")]
     out = []
-    for label, keys in TRAFFIC_SERVICES:
+    for label, keys, sr_product in TRAFFIC_SERVICES:
         svc = None
         for key in keys:
             svc = next((s_ for s_ in active if key in s_["name"].lower()), None)
             if svc: break
-        out.append((label, svc))
+        out.append((label, svc, sr_product))
     return out
 
 
@@ -1035,97 +1058,315 @@ async def send_long(bot: Bot, chat_id, text, markup=None):
         await bot.send_message(chat_id, part, reply_markup=markup if i == len(parts) - 1 else None)
 
 
+# ----- SR pasar dari API publik -----
+_sr_cache = {}   # slug layanan -> (berlaku sampai, {KODE_NEGARA: SR%})
+
+
+def _find_ops(data, country, product):
+    """Ambil {operator: {cost, count, rate}} dari respons API (tahan terhadap beda susunan JSON)."""
+    if not isinstance(data, dict): return {}
+    for first, second in ((country, product), (product, country)):
+        node = data.get(first)
+        if isinstance(node, dict):
+            node = node.get(second)
+            if isinstance(node, dict) and node:
+                return {k: v for k, v in node.items() if isinstance(v, dict)}
+    return {}
+
+
+def _weighted_sr(ops):
+    """SR rata-rata tertimbang stok dari semua operator yang masih punya stok. None jika tidak ada data."""
+    pts = []
+    for v in ops.values():
+        try:
+            rate, cnt = float(v.get("rate")), float(v.get("count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if cnt > 0: pts.append((min(100.0, max(0.0, rate)), cnt))
+    if not pts: return None
+    return round(sum(r_ * c_ for r_, c_ in pts) / sum(c_ for _, c_ in pts))
+
+
+async def market_sr(product):
+    """SR pasar (%) per negara prioritas untuk satu layanan. Di-cache 30 menit (5 menit jika gagal)."""
+    if not MARKET_SR: return {}
+    hit = _sr_cache.get(product)
+    if hit and time.time() < hit[0]: return hit[1]
+    out = {}
+    for code, slugs in SR_SLUGS.items():
+        for slug in slugs:
+            try:
+                async with http.get(SR_API, params={"country": slug, "product": product},
+                                    timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200: continue
+                    data = await resp.json(content_type=None)
+            except Exception as e:
+                log.warning("SR API gagal (%s/%s): %s", slug, product, e)
+                continue
+            sr_ = _weighted_sr(_find_ops(data, slug, product))
+            if sr_ is not None:
+                out[code] = sr_
+                break
+    _sr_cache[product] = (time.time() + (1800 if out else 300), out)
+    return out
+
+
 def sr_label(s_):
-    return "SR baru" if s_ is None else f"SR {s_}%" + (" 🔥" if s_ >= 60 else "")
+    return "" if s_ is None else f" · SR {s_}%" + (" 🔥" if s_ >= 60 else "")
 
 
-async def traffic_block(label, svc, by_code):
+# ----- pengumpulan data trafik -----
+async def traffic_block(label, svc, sr_product, by_code):
+    """Satu blok layanan. Return (teks, jumlah negara yang ada stoknya, pilihan terbaik atau None)."""
     if not svc:
-        return f"<b>{esc(label)}</b>\n└ <i>Layanan tidak ditemukan di katalog</i>"
-    sid = svc["id"]
-    products = await cached("/catalog/products", {"platform_id": sid, "sort": "price_asc", "limit": 10000}, ttl=60)
+        return f"<b>{esc(label)}</b>\n└ <i>Layanan tidak ditemukan di katalog</i>", 0, None
+    products = await cached("/catalog/products", {"platform_id": svc["id"], "sort": "price_asc", "limit": 10000}, ttl=60)
     stock = {}
     for p in products:
-        if p.get("active") and p.get("available", 0) > 0:
+        if p.get("active", True) and p.get("available", 0) > 0:
             stock.setdefault(p["country_id"], []).append(p)
-    csr, osr = await sr_stats(sid), await op_sr_stats(sid)
-    lines, best = "", []
-    for code in PRIO_COUNTRIES:
+    sr = await market_sr(sr_product)
+    lines, best, ready = "", [], 0
+    for idx, code in enumerate(PRIO_COUNTRIES):
         c = by_code.get(code)
         if not c: continue
-        flag, name = c.get("emoji", "🌍"), esc(c.get("name", code))
+        flag, name = c.get("emoji") or "🌍", esc(c.get("name", code))
         offs = stock.get(c["id"])
         if not offs:
             lines += f"🔴 {flag} <b>{name}</b> — stok habis\n"
             continue
-        cs = csr.get(c["id"])
-        ops = {}  # operator -> harga modal termurah + total stok
+        ready += 1
+        s_ = sr.get(code)
+        ops = {}  # operator -> harga modal termurah + total stok operator itu
         for p in offs:
             nm = p.get("operator_name") or "Any"
             o = ops.setdefault(nm, {"price": p["price"], "stock": 0})
             o["price"] = min(o["price"], p["price"])
             o["stock"] += p["available"]
-
-        def op_sr(nm):  # SR operator; jika datanya belum cukup, pakai SR negara
-            v = osr.get((c["id"], nm))
-            return cs if v is None else v
-
-        def rank(item):  # operator stabil dulu, lalu termurah
-            sr_ = op_sr(item[0])
-            return (0 if sr_ is None or sr_ >= GOOD_SR else 1, item[1]["price"], item[0])
-
-        ranked = sorted(ops.items(), key=rank)
-        emo = "🟢" if cs is None or cs >= GOOD_SR else "🟡" if cs >= 20 else "🔴"
-        lines += f"{emo} {flag} <b>{name}</b> · {sr_label(cs)} · stok {sum(o['stock'] for o in ops.values())}\n"
+        # operator dengan stok cukup dulu (lebih stabil), lalu yang termurah
+        ranked = sorted(ops.items(), key=lambda it: (it[1]["stock"] < TRAFFIC_MIN_STOCK, it[1]["price"], -it[1]["stock"]))
+        total = sum(o["stock"] for o in ops.values())
+        solid = total >= TRAFFIC_MIN_STOCK
+        emo = "🔴" if s_ is not None and s_ < 20 else "🟢" if solid and (s_ is None or s_ >= GOOD_SR) else "🟡"
+        lines += f"{emo} {flag} <b>{name}</b>{sr_label(s_)} · stok {total}\n"
         for nm, o in ranked[:TRAFFIC_OPS]:
-            v = osr.get((c["id"], nm))
-            lines += (f"   📡 <code>{esc(nm)}</code> · <b>{rp(sell_price(o['price'], c))}</b>"
-                      f"{'' if v is None else f' · SR {v}%'} · stok {o['stock']}\n")
+            lines += f"   📡 <code>{esc(nm)}</code> · <b>{rp(sell_price(o['price'], c))}</b> · stok {o['stock']}\n"
         top_nm, top = ranked[0]
-        if rank(ranked[0])[0] == 0 and (cs is None or cs >= GOOD_SR):
-            best.append((sell_price(top["price"], c), PRIO_COUNTRIES.index(code), flag, name, top_nm))
+        stable = solid and top["stock"] >= TRAFFIC_MIN_STOCK and ((s_ is not None and s_ >= GOOD_SR) if sr else True)
+        if stable:
+            best.append((sell_price(top["price"], c), idx, flag, name, top_nm))
+    pick = min(best) if best else None
     head = f"<b>{esc(label)}</b>\n"
-    if best:
-        price, _, flag, name, nm = min(best)
-        head += f"🏆 <i>Paling hemat &amp; stabil:</i> {flag} <b>{name}</b> · <code>{esc(nm)}</code> · <b>{rp(price)}</b>\n"
-    return head + (lines or "└ <i>Negara prioritas belum tersedia di katalog</i>\n").rstrip("\n")
+    if pick:
+        head += f"🏆 <i>Paling hemat &amp; stabil:</i> {pick[2]} <b>{pick[3]}</b> · <code>{esc(pick[4])}</code> · <b>{rp(pick[0])}</b>\n"
+    return head + (lines or "└ <i>Negara prioritas belum tersedia di katalog</i>\n").rstrip("\n"), ready, pick
 
 
-async def get_traffic_report():
+async def collect_traffic():
+    """Ambil data 3 layanan. RuntimeError jika katalog kosong / tidak ada stok (agar tidak kirim laporan kosong)."""
     services = await cached("/catalog/services", ttl=600)
     if not services:
-        return "⚠️ Data katalog belum bisa diambil dari API. Coba lagi sebentar."
+        raise RuntimeError("Data katalog belum bisa diambil dari API. Coba lagi sebentar.")
     by_code = {str(c.get("code", "")).upper(): c for c in await cached("/catalog/countries", ttl=600) if c.get("active")}
+    rows, ready = [], 0
+    for label, svc, sr_product in pick_services(services):
+        text, n, pick = await traffic_block(label, svc, sr_product, by_code)
+        rows.append((label, text, pick))
+        ready += n
+    if not ready:
+        raise RuntimeError("Tidak ada stok di negara prioritas saat ini.")
+    return rows
+
+
+# ===== ALUR 1: laporan trafik -> channel =====
+async def get_traffic_report(admin=False):
+    rows = await collect_traffic()
     blocks = ["🔥 <b>REKOMENDASI TRAFIK OTP · TERMURAH &amp; STABIL</b>\n" + LINE + "\n"
-              "<i>Prioritas negara: PH → ID → BR → CL → ZA. Operator diurutkan yang stabil &amp; termurah dulu.\n"
-              "SR = persentase OTP masuk dari transaksi toko (14 hari terakhir).\n"
-              "🟢 bagus · 🟡 sedang · 🔴 rendah/habis</i>"]
-    for label, svc in pick_services(services):
-        blocks.append(await traffic_block(label, svc, by_code))
-    blocks.append("🛒 <i>Yuk langsung amankan nomornya di bot sebelum kehabisan!</i>")
+              "<i>Prioritas negara: PH → ID → BR → CL → ZA. Operator diurutkan yang stoknya cukup &amp; termurah dulu.\n"
+              "SR = tingkat sukses OTP pasar. 🟢 bagus · 🟡 sedang · 🔴 rendah/habis</i>"]
+    blocks += [text for _, text, _ in rows]
+    if admin:
+        blocks.append("ℹ️ <i>Sumber: API SMSCode (harga, stok, operator) + API publik (SR pasar). Bukan data transaksi toko.</i>")
     return "\n\n".join(blocks)
 
 
-async def traffic_poller(bot: Bot):
-    """Kirim laporan trafik ke channel monitoring tiap 3 jam."""
-    while True:
-        await asyncio.sleep(TRAFFIC_EVERY)
-        if not CHANNEL_ID: continue
+async def post_traffic_channel(bot: Bot):
+    """Kirim laporan trafik ke channel. Error jika CHANNEL_ID kosong."""
+    if not CHANNEL_ID:
+        raise RuntimeError("CHANNEL_ID belum diisi di Variables Railway.")
+    text = await get_traffic_report()
+    me = await bot.get_me()
+    link = kb([[InlineKeyboardButton(text="🛒 Beli Nomor di Bot", url=f"https://t.me/{me.username}")]])
+    await send_long(bot, CHANNEL_ID, text, link)
+
+
+async def traffic_job(bot: Bot):
+    if not CHANNEL_ID: return
+    await post_traffic_channel(bot)
+    log.info("Laporan trafik terkirim ke channel.")
+
+
+# ===== ALUR 2: promosi -> user =====
+# Kata-kata promosi untuk user (dipilih acak tiap kirim, supaya tidak monoton).
+# Hanya klaim yang benar sesuai cara kerja bot: bayar QRIS, saldo otomatis, pesanan tanpa OTP dibatalkan & saldo kembali.
+def promo_opening():
+    return random.choice([
+        "🔥 <b>NOMOR OTP TERMURAH: FILIPINA, BRAZIL, CHILE &amp; INDONESIA</b>\n"
+        "Harga di bawah diambil real-time dari sistem, bukan harga lama. Bandingkan sendiri, lalu pilih yang paling pas.",
+        "💸 <b>CARI NOMOR OTP HEMAT? INI HARGA TERMURAH HARI INI</b>\n"
+        "Kami rangkum harga paling murah per layanan di 4 negara favorit. Tinggal pilih, tidak perlu keliling cek satu-satu.",
+        "📣 <b>HARGA TERMURAH OTP, UPDATE TERBARU</b>\n"
+        "Google, WhatsApp, Telegram: cek harga mulai dari berapa di Filipina, Brazil, Chile, dan Indonesia.",
+        "⚡ <b>JANGAN BELI BUTA, LIHAT HARGANYA DULU</b>\n"
+        "Ini daftar harga termurah saat ini untuk 4 negara paling dicari. Yang termurah ditandai 🏆.",
+    ])
+
+
+def promo_closing():
+    mins = max(1, AUTO_CANCEL // 60)
+    return random.choice([
+        f"💬 <b>Masih ragu?</b> Coba 1 nomor dulu. Top up mulai {rp(MIN_DEP)} via QRIS, saldo masuk otomatis. "
+        f"Kalau OTP tidak masuk dalam {mins} menit, pesanan dibatalkan dan saldo kembali otomatis, jadi risikonya kecil.",
+        "🛡 <b>Beli tanpa was-was:</b> bayar QRIS, saldo masuk otomatis, biaya admin top up ditampilkan jelas sebelum kamu bayar. "
+        "OTP tidak masuk? Saldo kembali otomatis.",
+        "🤝 Kami lebih suka kamu mencoba daripada hanya percaya janji. Ambil satu nomor, lihat sendiri OTP-nya masuk. "
+        "Kalau gagal, pesanan dibatalkan dan saldo balik otomatis.",
+        f"⏱ Daftar harga ini diperbarui otomatis {len(PROMO_SLOTS)}x sehari. "
+        "Tinggal pilih layanan, negara, operator, selesai dalam hitungan menit.",
+    ])
+
+
+async def promo_service_prices(svc, by_code):
+    """Harga jual TERMURAH per negara promosi (PROMO_COUNTRIES) untuk satu layanan.
+    Return [(harga, emoji, nama negara)] urut termurah. Negara tanpa stok dilewati.
+    Penawaran dengan stok >= TRAFFIC_MIN_STOCK diutamakan agar harga murah yang tampil tidak cuma 1-2 nomor."""
+    products = await cached("/catalog/products", {"platform_id": svc["id"], "sort": "price_asc", "limit": 10000}, ttl=60)
+    stock = {}
+    for p in products:
+        if p.get("active", True) and p.get("available", 0) > 0:
+            stock.setdefault(p["country_id"], []).append(p)
+    out = []
+    for code in PROMO_COUNTRIES:
+        c = by_code.get(code)
+        offs = stock.get(c["id"]) if c else None
+        if not offs: continue
+        pool = [p for p in offs if p["available"] >= TRAFFIC_MIN_STOCK] or offs
+        top = min(pool, key=lambda p: p["price"])
+        out.append((sell_price(top["price"], c), c.get("emoji") or "🌍", esc(c.get("name", code))))
+    return sorted(out)
+
+
+async def get_promo_text():
+    """Pesan promosi: ajakan + harga termurah per layanan di PH, BR, CL, ID (data real-time) + penutup untuk yang ragu."""
+    services = await cached("/catalog/services", ttl=600)
+    if not services:
+        raise RuntimeError("Data katalog belum bisa diambil dari API. Coba lagi sebentar.")
+    by_code = {str(c.get("code", "")).upper(): c for c in await cached("/catalog/countries", ttl=600) if c.get("active")}
+    blocks, found = [promo_opening()], 0
+    for label, svc, _ in pick_services(services):
+        if not svc: continue
+        rows = await promo_service_prices(svc, by_code)
+        if not rows: continue
+        found += 1
+        lines = [f"<b>{esc(label)}</b>"]
+        for i, (price, flag, name) in enumerate(rows):
+            lines.append(f"{'🏆' if i == 0 else '▫️'} {flag} {name} · <b>{rp(price)}</b>")
+        blocks.append("\n".join(lines))
+    if not found:
+        raise RuntimeError("Tidak ada stok di Filipina, Brazil, Chile, dan Indonesia saat ini.")
+    blocks.append("<i>Harga &amp; stok bisa berubah sewaktu-waktu mengikuti ketersediaan.</i>")
+    blocks.append(promo_closing())
+    return "\n\n".join(blocks)
+
+
+async def promo_enabled():
+    row = await one("SELECT value FROM settings WHERE key='promo_on'")
+    return row is None or row["value"] != "0"          # default: aktif
+
+
+async def set_promo_enabled(on):
+    await run("INSERT OR REPLACE INTO settings(key,value) VALUES('promo_on',?)", ("1" if on else "0",))
+
+
+async def _send_user(bot: Bot, uid, parts, markup, errs=None):
+    """Kirim ke satu user. Return 'ok' / 'blocked' / 'failed'. Menunggu otomatis jika kena batas Telegram."""
+    for attempt in (1, 2):
         try:
-            await send_long(bot, CHANNEL_ID, await get_traffic_report())
-            log.info("Laporan trafik otomatis terkirim ke channel.")
+            for i, part in enumerate(parts):
+                await bot.send_message(uid, part, reply_markup=markup if i == len(parts) - 1 else None)
+            return "ok"
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(float(getattr(e, "retry_after", 5)) + 1)
+        except TelegramForbiddenError:
+            return "blocked"
         except Exception as e:
-            log.warning("Gagal kirim laporan trafik otomatis: %s", e)
+            log.warning("Promo ke %s gagal: %s", uid, e)
+            if errs is not None: errs.append(str(e)[:90])
+            return "failed"
+    return "failed"
 
 
+async def do_promo(bot: Bot):
+    """Kirim promosi ke SEMUA user bot (yang pernah /start). Tidak mengirim apa pun ke channel."""
+    parts = split_msg(await get_promo_text())      # RuntimeError jika data kosong -> tidak ada yang dikirim
+    menu = kb([[b("🛒 Beli Nomor Sekarang", "hm")]])
+    res = {"ok": 0, "blocked": 0, "failed": 0, "errors": []}
+    for row in await fetch("SELECT id FROM users"):
+        res[await _send_user(bot, row["id"], parts, menu, res["errors"])] += 1
+        await asyncio.sleep(0.06)  # ±16 pesan/detik, aman dari batas Telegram
+    return res
+
+
+async def promo_job(bot: Bot):
+    if not await promo_enabled():
+        log.info("Auto broadcast promosi nonaktif, jadwal dilewati.")
+        return
+    log.info("Promosi ke user selesai: %s", await do_promo(bot))
+
+
+def promo_summary(res):
+    total = res["ok"] + res["blocked"] + res["failed"]
+    txt = (f"📢 <b>Promosi selesai</b>\nTarget: {total} user (semua yang pernah /start)\n"
+           f"✅ terkirim {res['ok']} · 🚫 blokir bot {res['blocked']} · ❌ gagal {res['failed']}")
+    if res.get("errors"):
+        from collections import Counter
+        txt += "\n\nAlasan gagal:\n" + "\n".join(f"• {esc(m)} ({n}x)" for m, n in Counter(res["errors"]).most_common(3))
+    return txt
+
+
+# ----- penjadwal (dipakai untuk kedua alur) -----
+def next_slot(now, slots):
+    """Waktu terjadwal berikutnya (> now)."""
+    for day in (0, 1):
+        for hh, mm in slots:
+            t = (now + timedelta(days=day)).replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if t > now: return t
+
+
+async def run_schedule(name, slots, job, bot: Bot):
+    tz = timezone(timedelta(hours=BROADCAST_TZ))
+    log.info("Jadwal %s aktif: %s (UTC%+d)", name, ", ".join(f"{h:02d}:{m:02d}" for h, m in slots), BROADCAST_TZ)
+    while True:
+        nxt = next_slot(datetime.now(tz), slots)
+        while True:
+            left = (nxt - datetime.now(tz)).total_seconds()
+            if left <= 0: break
+            await asyncio.sleep(min(left, 60))
+        try:
+            await job(bot)
+        except Exception as e:
+            log.warning("Jadwal %s dilewati: %s", name, e)
+
+
+# ===== perintah admin: /trafik (channel) =====
 @r.message(Command("trafik"))
 async def cmd_trafik(m: Message):
     if m.from_user.id not in ADMINS: return
-    loading = await m.answer("🔍 Menganalisis data trafik <i>real-time</i>...")
+    loading = await m.answer("🔍 Mengambil data trafik dari API...")
     try:
-        parts = split_msg(await get_traffic_report())
+        parts = split_msg(await get_traffic_report(admin=True))
     except Exception as e:
-        log.exception("trafik gagal")
+        log.warning("trafik gagal: %s", e)
         return await loading.edit_text(f"❌ Gagal membuat laporan: {esc(e)}")
     markup = kb([[b("📡 Kirim ke Channel", "send_chan")]])
     await loading.edit_text(parts[0], reply_markup=markup if len(parts) == 1 else None)
@@ -1139,10 +1380,75 @@ async def send_chan_callback(cb: CallbackQuery, bot: Bot):
     if not CHANNEL_ID:
         return await cb.answer("CHANNEL_ID belum diisi di Variables Railway!", show_alert=True)
     try:
-        await send_long(bot, CHANNEL_ID, await get_traffic_report())
+        await post_traffic_channel(bot)
         await cb.answer("✅ Berhasil dikirim ke channel!", show_alert=True)
     except Exception as e:
         await cb.answer(f"Gagal kirim: {e}"[:190], show_alert=True)
+
+
+# ===== perintah admin: /autobroadcast (promosi ke user) =====
+async def autobroadcast_panel():
+    on = await promo_enabled()
+    users = (await one("SELECT COUNT(*) c FROM users"))["c"]
+    sched = ", ".join(f"{h:02d}:{m:02d}" for h, m in PROMO_SLOTS)
+    text = (f"📢 <b>AUTO BROADCAST PROMOSI</b>\n{LINE}\n"
+            f"Status: {'🟢 AKTIF' if on else '⏸ NONAKTIF'}\n"
+            f"Jadwal: {sched} (UTC{BROADCAST_TZ:+d})\n"
+            f"Target: {users} user (semua yang pernah /start)\n\n"
+            "<i>Isi: harga termurah per layanan di PH, BR, CL, ID + ajakan untuk yang masih ragu. "
+            "Hanya ke user. Laporan trafik ke channel diatur lewat /trafik.</i>")
+    markup = kb([[b("⏸ Matikan" if on else "▶️ Aktifkan", "ab_toggle")],
+                 [b("👁 Preview", "ab_prev"), b("📢 Kirim Sekarang", "ab_now")]])
+    return text, markup
+
+
+async def _show_panel(cb: CallbackQuery):
+    text, markup = await autobroadcast_panel()
+    try:
+        await cb.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest:
+        pass  # isi sama persis
+
+
+@r.message(Command("autobroadcast"))
+async def cmd_autobroadcast(m: Message):
+    if m.from_user.id not in ADMINS: return
+    text, markup = await autobroadcast_panel()
+    await m.answer(text, reply_markup=markup)
+
+
+@r.callback_query(F.data.startswith("ab_"))
+async def autobroadcast_callback(cb: CallbackQuery, bot: Bot):
+    if cb.from_user.id not in ADMINS: return await cb.answer("Khusus admin.", show_alert=True)
+    act = cb.data
+    if act == "ab_toggle":
+        await set_promo_enabled(not await promo_enabled())
+        await cb.answer("Status diubah.")
+        await _show_panel(cb)
+    elif act == "ab_back":
+        await cb.answer()
+        await _show_panel(cb)
+    elif act == "ab_prev":
+        try:
+            text = await get_promo_text()
+        except Exception as e:
+            return await cb.answer(f"Gagal: {e}"[:190], show_alert=True)
+        await cb.answer()
+        await cb.message.answer("👁 <b>Preview promosi</b> (hanya dikirim ke kamu):\n\n" + text)
+    elif act == "ab_now":
+        users = (await one("SELECT COUNT(*) c FROM users"))["c"]
+        await cb.answer()
+        await cb.message.edit_text(f"⚠️ Kirim promosi ke <b>{users} user</b> sekarang?",
+                                   reply_markup=kb([[b("✅ Ya, kirim", "ab_go"), b("‹ Batal", "ab_back")]]))
+    elif act == "ab_go":
+        await cb.answer("⏳ Mengirim, tunggu ringkasannya...")
+        await _show_panel(cb)
+        try:
+            await cb.message.answer(promo_summary(await do_promo(bot)))
+        except Exception as e:
+            await cb.message.answer(f"❌ Promosi gagal: {esc(e)}")
+    else:
+        await cb.answer()
 
 
 async def main():
@@ -1172,13 +1478,15 @@ async def main():
         await web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
         log.info("Webhook Kasera aktif di port %s", WEBHOOK_PORT)
     task = asyncio.create_task(poller(bot))
-    ttask = asyncio.create_task(traffic_poller(bot))
+    ttask = asyncio.create_task(run_schedule("trafik-channel", TRAFFIC_SLOTS, traffic_job, bot))
+    ptask = asyncio.create_task(run_schedule("promo-user", PROMO_SLOTS, promo_job, bot))
     try:
         await dp_.start_polling(bot)
     finally:
         if runner: await runner.cleanup()
         task.cancel()
         ttask.cancel()
+        ptask.cancel()
         await http.close()
         await db.close()
 
