@@ -485,6 +485,16 @@ def hist_kb(active):
     return kb([[b("• 🛒 Pesanan", "hist"), b("💳 Riwayat Top Up", "histd")],
                [b("🏠 Menu Utama", "home")]])
 
+async def show_any(cb: CallbackQuery, text, markup=None):
+    """Seperti show(), tapi kalau teks terlalu panjang untuk caption foto (>1024), kirim sebagai pesan baru."""
+    if cb.message.photo and len(text) > 1000:
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        return await cb.message.answer(text, reply_markup=markup)
+    await show(cb, text, markup)
+
 @r.callback_query(F.data == "hist")
 async def hist(cb: CallbackQuery):
     await cb.answer()
@@ -503,7 +513,7 @@ async def hist(cb: CallbackQuery):
         line += f"\n   🕒 {_tgl(o['created'])} · {STATUS[o['status']].split(' · ')[0]}"
         items.append(line)
     body = "\n\n".join(items) or "<i>Belum ada pesanan.</i>"
-    await show(cb, f"📜 <b>RIWAYAT PESANAN</b>\n{LINE}\n"
+    await show_any(cb, f"📜 <b>RIWAYAT PESANAN</b>\n{LINE}\n"
                    f"<blockquote>📊 Total  <b>{st['n'] or 0}</b>   ✅ <b>{st['ok'] or 0}</b>   ❌ <b>{st['bad'] or 0}</b>\n"
                    f"💸 Total belanja  <b>{rp(st['spent'] or 0)}</b></blockquote>\n"
                    f"<blockquote expandable>{body}</blockquote>\n<i>Menampilkan 8 pesanan terakhir.</i>", hist_kb("o"))
@@ -523,7 +533,7 @@ async def hist_dep(cb: CallbackQuery):
                      f"   💳 Dibayar {rp(d['total'] or d['amount'])}\n"
                      f"   🕒 {_tgl(d['created'])} · {stt.split(' ', 1)[1]}")
     body = "\n\n".join(items) or "<i>Belum ada riwayat top up.</i>"
-    await show(cb, f"💳 <b>RIWAYAT TOP UP</b>\n{LINE}\n"
+    await show_any(cb, f"💳 <b>RIWAYAT TOP UP</b>\n{LINE}\n"
                    f"<blockquote>📊 Total  <b>{st['n'] or 0}</b>   ✅ <b>{st['ok'] or 0}</b>   ❌ <b>{st['bad'] or 0}</b>\n"
                    f"💰 Total saldo masuk  <b>{rp(st['tot'] or 0)}</b></blockquote>\n"
                    f"<blockquote expandable>{body}</blockquote>\n<i>Menampilkan 8 top up terakhir.</i>",
