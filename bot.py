@@ -43,6 +43,11 @@ BANNER_FILE = os.getenv("BANNER_FILE", "robot_banner.jpg")   # taruh file ini di
 _c = os.getenv("CHANNEL_ID", "").strip()                     # contoh: -1001234567890
 CHANNEL_ID = int(_c) if _c.lstrip("-").isdigit() else (_c or None)
 CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()           # link channel (opsional, untuk tombol di menu)
+# ===== WAJIB JOIN CHANNEL =====
+# Isi dengan username channel (contoh: "@umkmotp") atau ID (contoh: "-1001234567890").
+# Bot WAJIB dijadikan admin di channel tsb. Kosongkan ("") untuk mematikan fitur wajib join.
+gateway_channel = os.getenv("GATEWAY_CHANNEL", "").strip()
+gateway_channel_url = os.getenv("GATEWAY_CHANNEL_URL", "").strip()   # opsional, link undangan untuk channel privat
 PER_PAGE = 7
 SR_MIN = 5                                                   # minimal transaksi agar SR ditampilkan
 PRIO_COUNTRIES = ["PH", "ID", "BR", "CL", "ZA"]              # selalu di atas pada halaman 1
@@ -289,9 +294,32 @@ def banner_photo():
     return BufferedInputFile(base64.b64decode(BANNER_B64), "robot_banner.jpg")
 
 
-STATUS = {"ACTIVE": "🟢 Menunggu kode OTP...", "OTP": "🟢 Kode OTP diterima", "COMPLETED": "🏁 Selesai",
-          "CANCELED": "🔴 Dibatalkan · saldo kembali", "EXPIRED": "⚪ Kedaluwarsa · saldo kembali"}
-EMOJI = {"ACTIVE": "🟡", "OTP": "🟢", "COMPLETED": "🏁", "CANCELED": "🔴", "EXPIRED": "⚪"}
+STATUS = {"ACTIVE": "🟢 Menunggu kode OTP...", "OTP": "🟢 Kode OTP diterima", "COMPLETED": "✅ Selesai",
+          "CANCELED": "❌ Dibatalkan · saldo kembali", "EXPIRED": "❌ Kedaluwarsa · saldo kembali"}
+EMOJI = {"ACTIVE": "🟡", "OTP": "🟢", "COMPLETED": "✅", "CANCELED": "❌", "EXPIRED": "❌"}
+
+def cancel_notice(o, price, title, reason):
+    """Kartu notifikasi pesanan gagal / OTP tidak masuk (tampilan premium)."""
+    where = o.get("svc") or o.get("label") or "-"
+    if o.get("ctry"): where += f" ({o['ctry']})"
+    jam = datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y · %H:%M WIB")
+    return (f"❌ <b>{title}</b>\n{LINE}\n"
+            f"<blockquote>🧾 Pesanan  <b>#{o['id']}</b>\n"
+            f"📞 Nomor  <code>{esc(o.get('phone') or '-')}</code>\n"
+            f"🏢 Layanan  <b>{esc(where)}</b>\n"
+            f"📌 Status  <b>❌ Gagal</b></blockquote>\n"
+            f"💸 <b>REFUND OTOMATIS</b>\n"
+            f"<blockquote>💰 Dikembalikan  <b>+{rp(price)}</b>\n"
+            f"🕒 Waktu  {jam}</blockquote>\n"
+            f"ℹ️ <i>{reason}</i>\n"
+            f"✨ <i>Saldo sudah kembali utuh, silakan coba nomor lain.</i>")
+
+def cancel_kb(o):
+    rows = []
+    if o.get("sid") and o.get("cid"):
+        rows.append([b("🛒 Beli Lagi", f"rb:{o['id']}")])
+    rows.append([b("🏠 Menu Utama", "hm")])
+    return kb(rows)
 
 def copy_btn(text, value, oid, kind):
     if CopyTextButton:
@@ -344,6 +372,74 @@ async def refresh_card(bot, o):
             log.warning("refresh_card gagal: %s", e)
 
 
+# ---------- wajib join channel ----------
+async def is_joined(bot: Bot, uid):
+    if not gateway_channel or uid in ADMINS:
+        return True
+    try:
+        m = await bot.get_chat_member(gateway_channel, uid)
+        return m.status in ("member", "administrator", "creator", "restricted")
+    except Exception as e:
+        log.warning("cek join gateway_channel gagal: %s", e)
+        return True   # jangan kunci user kalau bot belum admin / channel salah
+
+def join_url():
+    if gateway_channel_url: return gateway_channel_url
+    c = str(gateway_channel)
+    return f"https://t.me/{c.lstrip('@')}" if c.startswith("@") else None
+
+def join_text(name, failed=False):
+    t = (f"🔒 <b>AKSES TERKUNCI</b>\n{LINE}\n"
+         f"Halo <b>{esc(name)}</b>! 👋\n\n"
+         f"<blockquote>📢 Untuk menggunakan bot ini, kamu wajib join channel resmi kami terlebih dahulu.\n\n"
+         f"1️⃣ Klik <b>📢 Join Channel</b>\n2️⃣ Setelah join, klik <b>🔄 Refresh / Sudah Join</b></blockquote>")
+    if failed:
+        t += "\n❌ <b>Kamu belum terdeteksi join.</b> Silakan join dulu lalu tekan refresh."
+    return t
+
+def join_kb():
+    rows = []
+    if (u := join_url()):
+        rows.append([InlineKeyboardButton(text="📢 Join Channel", url=u)])
+    rows.append([b("🔄 Refresh / Sudah Join", "jc")])
+    return kb(rows)
+
+class JoinGate:
+    async def __call__(self, handler, event, data):
+        u = getattr(event, "from_user", None)
+        if not u or (isinstance(event, CallbackQuery) and event.data == "jc"):
+            return await handler(event, data)
+        if isinstance(event, Message) and event.chat.type != "private":
+            return await handler(event, data)
+        if await is_joined(data["bot"], u.id):
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery):
+            await event.answer("🔒 Join channel dulu ya!", show_alert=True)
+            await event.message.answer(join_text(u.full_name), reply_markup=join_kb())
+        else:
+            await event.answer(join_text(u.full_name), reply_markup=join_kb())
+
+r.message.outer_middleware(JoinGate())
+r.callback_query.outer_middleware(JoinGate())
+
+@r.callback_query(F.data == "jc")
+async def join_check(cb: CallbackQuery, bot: Bot, state: FSMContext):
+    if not await is_joined(bot, cb.from_user.id):
+        await cb.answer("❌ Kamu belum join channel.", show_alert=True)
+        try:
+            await cb.message.edit_text(join_text(cb.from_user.full_name, True), reply_markup=join_kb())
+        except TelegramBadRequest:
+            pass
+        return
+    await cb.answer("✅ Terima kasih sudah join!", show_alert=True)
+    try:
+        await cb.message.edit_text(f"✅ <b>VERIFIKASI BERHASIL</b>\n{LINE}\n<blockquote>🎉 Kamu sudah join channel. Selamat menggunakan bot!</blockquote>")
+    except TelegramBadRequest:
+        pass
+    await state.clear()
+    await send_home(cb.message, cb.from_user.full_name, cb.from_user.id)
+
+
 # ---------- menu utama ----------
 @r.message(CommandStart())
 async def start(m: Message, state: FSMContext):
@@ -379,12 +475,60 @@ async def me(cb: CallbackQuery):
                    f"Saldo  <b>{rp(bal)}</b>\n🧾 Total pesanan  <b>{n}</b></blockquote>",
                kb([[b("💳 Top Up Saldo", "dep")], [b("🏠 Menu Utama", "home")]]))
 
+DEP_ST = {"OK": "✅ Berhasil", "PENDING": "⏳ Menunggu", "REJECTED": "❌ Ditolak",
+          "FAILED": "❌ Gagal", "EXPIRED": "❌ Kedaluwarsa"}
+
+def _tgl(ts):
+    return datetime.fromtimestamp(ts or 0, timezone(timedelta(hours=7))).strftime("%d/%m/%y %H:%M")
+
+def hist_kb(active):
+    return kb([[b("• 🛒 Pesanan", "hist"), b("💳 Riwayat Top Up", "histd")],
+               [b("🏠 Menu Utama", "home")]])
+
 @r.callback_query(F.data == "hist")
 async def hist(cb: CallbackQuery):
     await cb.answer()
-    rows = await fetch("SELECT * FROM orders WHERE user_id=? ORDER BY created DESC LIMIT 8", (cb.from_user.id,))
-    body = "\n".join(f"{EMOJI[o['status']]} <b>#{o['id']}</b> · {esc(o['label'])} · {rp(o['price'])}" for o in rows) or "<i>Belum ada pesanan.</i>"
-    await show(cb, f"📜 <b>RIWAYAT PESANAN</b>\n{LINE}\n<blockquote>{body}</blockquote>", kb([[b("🏠 Menu Utama", "home")]]))
+    uid = cb.from_user.id
+    rows = await fetch("SELECT * FROM orders WHERE user_id=? ORDER BY created DESC LIMIT 8", (uid,))
+    st = await one("SELECT COUNT(*) n, SUM(CASE WHEN status IN ('COMPLETED','OTP') THEN 1 ELSE 0 END) ok, "
+                   "SUM(CASE WHEN status IN ('CANCELED','EXPIRED') THEN 1 ELSE 0 END) bad, "
+                   "COALESCE(SUM(CASE WHEN refunded=0 THEN price ELSE 0 END),0) spent FROM orders WHERE user_id=?", (uid,))
+    items = []
+    for o in rows:
+        where = o.get("svc") or o["label"]
+        if o.get("ctry"): where += f" ({o['ctry']})"
+        line = (f"{EMOJI[o['status']]} <b>#{o['id']}</b> · {rp(o['price'])}\n"
+                f"   🏢 {esc(where)}\n   📞 <code>{esc(o['phone'])}</code>")
+        if o.get("code"): line += f"\n   🔑 OTP <code>{esc(o['code'])}</code>"
+        line += f"\n   🕒 {_tgl(o['created'])} · {STATUS[o['status']].split(' · ')[0]}"
+        items.append(line)
+    body = "\n\n".join(items) or "<i>Belum ada pesanan.</i>"
+    await show(cb, f"📜 <b>RIWAYAT PESANAN</b>\n{LINE}\n"
+                   f"<blockquote>📊 Total  <b>{st['n'] or 0}</b>   ✅ <b>{st['ok'] or 0}</b>   ❌ <b>{st['bad'] or 0}</b>\n"
+                   f"💸 Total belanja  <b>{rp(st['spent'] or 0)}</b></blockquote>\n"
+                   f"<blockquote expandable>{body}</blockquote>\n<i>Menampilkan 8 pesanan terakhir.</i>", hist_kb("o"))
+
+@r.callback_query(F.data == "histd")
+async def hist_dep(cb: CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    rows = await fetch("SELECT * FROM deposits WHERE user_id=? ORDER BY created DESC LIMIT 8", (uid,))
+    st = await one("SELECT COUNT(*) n, SUM(CASE WHEN status='OK' THEN 1 ELSE 0 END) ok, "
+                   "SUM(CASE WHEN status IN ('REJECTED','FAILED','EXPIRED') THEN 1 ELSE 0 END) bad, "
+                   "COALESCE(SUM(CASE WHEN status='OK' THEN amount ELSE 0 END),0) tot FROM deposits WHERE user_id=?", (uid,))
+    items = []
+    for d in rows:
+        stt = DEP_ST.get(d["status"], d["status"])
+        items.append(f"{stt.split(' ')[0]} <b>#{d['id']}</b> · <b>+{rp(d['amount'])}</b>\n"
+                     f"   💳 Dibayar {rp(d['total'] or d['amount'])}\n"
+                     f"   🕒 {_tgl(d['created'])} · {stt.split(' ', 1)[1]}")
+    body = "\n\n".join(items) or "<i>Belum ada riwayat top up.</i>"
+    await show(cb, f"💳 <b>RIWAYAT TOP UP</b>\n{LINE}\n"
+                   f"<blockquote>📊 Total  <b>{st['n'] or 0}</b>   ✅ <b>{st['ok'] or 0}</b>   ❌ <b>{st['bad'] or 0}</b>\n"
+                   f"💰 Total saldo masuk  <b>{rp(st['tot'] or 0)}</b></blockquote>\n"
+                   f"<blockquote expandable>{body}</blockquote>\n<i>Menampilkan 8 top up terakhir.</i>",
+               kb([[b("• 💳 Top Up", "histd"), b("🛒 Pesanan", "hist")],
+                   [b("➕ Top Up Sekarang", "dep")], [b("🏠 Menu Utama", "home")]]))
 
 @r.callback_query(F.data == "help")
 async def help_(cb: CallbackQuery):
@@ -980,14 +1124,17 @@ async def poll(bot: Bot):
                 _, err = await api("POST", "/orders/cancel", json={"id": o["id"]})
                 if not err and (done := await refund(o["id"], "CANCELED")):
                     await refresh_card(bot, await one("SELECT * FROM orders WHERE id=?", (o["id"],)))
-                    await bot.send_message(o["user_id"], f"⌛ OTP tidak masuk. Pesanan #{o['id']} dibatalkan, {rp(done['price'])} dikembalikan.")
+                    await bot.send_message(o["user_id"], cancel_notice(o, done["price"], "OTP TIDAK MASUK",
+                                           f"Kode tidak masuk dalam {AUTO_CANCEL // 60} menit, pesanan dibatalkan otomatis."),
+                                           reply_markup=cancel_kb(o))
         else:
             d, _ = await api("GET", f"/orders/{o['id']}")
             if not d: continue
             if d["status"] in ("EXPIRED", "CANCELED") and not o["otp"]:
                 if done := await refund(o["id"], d["status"]):
                     await refresh_card(bot, await one("SELECT * FROM orders WHERE id=?", (o["id"],)))
-                    await bot.send_message(o["user_id"], f"↩️ Pesanan #{o['id']} berakhir tanpa OTP. {rp(done['price'])} dikembalikan.")
+                    await bot.send_message(o["user_id"], cancel_notice(o, done["price"], "PESANAN BERAKHIR",
+                                           "Pesanan berakhir tanpa kode OTP."), reply_markup=cancel_kb(o))
             elif d["status"] in ("COMPLETED", "EXPIRED", "CANCELED"):
                 await run("UPDATE orders SET status='COMPLETED' WHERE id=? AND refunded=0", (o["id"],))
                 await refresh_card(bot, await one("SELECT * FROM orders WHERE id=?", (o["id"],)))
