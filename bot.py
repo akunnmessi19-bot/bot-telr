@@ -1,5 +1,5 @@
 """Bot Telegram toko nomor virtual - SMSCode API v1 (IDR). Python 3.10+ / aiogram 3."""
-import asyncio, base64, hashlib, hmac, html, io, json, logging, math, os, random, time, uuid
+import asyncio, base64, hashlib, hmac, html, io, json, logging, math, os, random, shutil, sqlite3, tempfile, time, uuid
 from datetime import datetime, timedelta, timezone
 import aiohttp, aiosqlite, qrcode
 from aiohttp import web
@@ -853,7 +853,7 @@ async def admin(m: Message):
     o = await one("SELECT COUNT(*) c, COALESCE(SUM(price),0) s FROM orders WHERE refunded=0")
     await m.answer(f"🛠 <b>Admin</b>\n{LINE}\n👥 User: {u}\n🧾 Order sukses/aktif: {o['c']}\n💵 Omzet: {rp(o['s'])}\n"
                    f"🏦 Saldo SMSCode: {rp(d['balance']) if d else 'n/a'}\n\n"
-                   f"/addsaldo &lt;user_id&gt; &lt;nominal&gt;\n/broadcast &lt;pesan&gt; (manual ke user)\n/trafik (laporan trafik, HANYA ke channel)\n/autobroadcast (promosi harga termurah, HANYA ke user)\n/testchannel")
+                   f"/addsaldo &lt;user_id&gt; &lt;nominal&gt;\n/broadcast &lt;pesan&gt; (manual ke user)\n/trafik (laporan trafik, HANYA ke channel)\n/autobroadcast (promosi harga termurah, HANYA ke user)\n/testchannel\n/backup (kirim file database ke chat ini)\n/restore (kirim file .db dengan caption /restore)")
 
 @r.message(Command("addsaldo"))
 async def addsaldo(m: Message):
@@ -1453,6 +1453,106 @@ async def autobroadcast_callback(cb: CallbackQuery, bot: Bot):
         await cb.answer()
 
 
+# ===== backup & restore database (admin) =====
+BACKUP_HOURS = float(os.getenv("BACKUP_HOURS", "24"))   # backup otomatis ke admin tiap N jam; 0 = mati
+
+
+async def make_backup_file():
+    """Salinan database yang konsisten (VACUUM INTO) di folder sementara."""
+    await db.commit()
+    path = os.path.join(tempfile.gettempdir(), f"store_backup_{int(time.time())}.db")
+    if os.path.exists(path): os.remove(path)
+    await db.execute("VACUUM INTO ?", (path,))
+    return path
+
+
+async def send_backup(bot: Bot, chat_id: int, auto: bool = False):
+    path = await make_backup_file()
+    try:
+        n = (await one("SELECT COUNT(*) c FROM users"))["c"]
+        stamp = datetime.now(WIB).strftime("%Y%m%d_%H%M")
+        cap = (f"💾 <b>Backup database</b>{' (otomatis)' if auto else ''}\n"
+               f"{n} user • {datetime.now(WIB).strftime('%d %b %Y %H:%M')} WIB\n"
+               f"<i>Simpan file ini. Untuk memulihkan: kirim file ini ke bot dengan caption /restore</i>")
+        await bot.send_document(chat_id, FSInputFile(path, filename=f"store_{stamp}.db"), caption=cap)
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+
+
+@r.message(Command("backup"))
+async def cmd_backup(m: Message, bot: Bot):
+    if m.from_user.id not in ADMINS: return
+    try:
+        await send_backup(bot, m.chat.id)
+    except Exception as e:
+        log.exception("backup gagal")
+        await m.answer(f"❌ Backup gagal: {esc(e)}")
+
+
+def _validate_db(path: str):
+    """Pastikan file adalah database SQLite yang valid dan punya tabel users."""
+    c = sqlite3.connect(path)
+    try:
+        if c.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            return "Database rusak (integrity_check gagal)."
+        names = {x[0] for x in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "users" not in names:
+            return "Bukan database bot ini (tabel users tidak ada)."
+        return None
+    except sqlite3.DatabaseError as e:
+        return f"File bukan database SQLite yang valid: {e}"
+    finally:
+        c.close()
+
+
+@r.message(F.document, F.caption.startswith("/restore"))
+async def cmd_restore_file(m: Message, bot: Bot):
+    global db
+    if m.from_user.id not in ADMINS: return
+    tmp = os.path.join(tempfile.gettempdir(), f"restore_{int(time.time())}.db")
+    try:
+        await bot.download(m.document, destination=tmp)
+        err = await asyncio.to_thread(_validate_db, tmp)
+        if err: return await m.answer(f"❌ {esc(err)}")
+        await db.commit()
+        await db.close()
+        for ext in ("-wal", "-shm"):
+            if os.path.exists(DB_PATH + ext): os.remove(DB_PATH + ext)
+        shutil.copyfile(tmp, DB_PATH)
+        db = await aiosqlite.connect(DB_PATH)
+        db.row_factory = aiosqlite.Row
+        await init_db()
+        n = (await one("SELECT COUNT(*) c FROM users"))["c"]
+        await m.answer(f"✅ Database dipulihkan. {n} user terdaftar.")
+    except Exception as e:
+        log.exception("restore gagal")
+        try:
+            db = await aiosqlite.connect(DB_PATH); db.row_factory = aiosqlite.Row
+        except Exception: pass
+        await m.answer(f"❌ Restore gagal: {esc(e)}")
+    finally:
+        try: os.remove(tmp)
+        except OSError: pass
+
+
+@r.message(Command("restore"))
+async def cmd_restore_help(m: Message):
+    if m.from_user.id not in ADMINS: return
+    await m.answer("Kirim file backup <code>.db</code> ke chat ini, lalu isi <b>caption</b>-nya dengan <code>/restore</code>.\n"
+                   "⚠️ Data saat ini akan <b>diganti</b> isi file tersebut.")
+
+
+async def backup_loop(bot: Bot):
+    if BACKUP_HOURS <= 0: return
+    log.info("Backup otomatis ke admin tiap %s jam", BACKUP_HOURS)
+    while True:
+        await asyncio.sleep(BACKUP_HOURS * 3600)
+        for a in ADMINS:
+            try: await send_backup(bot, a, auto=True)
+            except Exception as e: log.warning("Backup otomatis ke %s gagal: %s", a, e)
+
+
 async def main():
     global db, http
     os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
@@ -1485,6 +1585,7 @@ async def main():
     task = asyncio.create_task(poller(bot))
     ttask = asyncio.create_task(run_schedule("trafik-channel", TRAFFIC_SLOTS, traffic_job, bot))
     ptask = asyncio.create_task(run_schedule("promo-user", PROMO_SLOTS, promo_job, bot))
+    btask = asyncio.create_task(backup_loop(bot))
     try:
         await dp_.start_polling(bot)
     finally:
@@ -1492,6 +1593,7 @@ async def main():
         task.cancel()
         ttask.cancel()
         ptask.cancel()
+        btask.cancel()
         await http.close()
         await db.close()
 
