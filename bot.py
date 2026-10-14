@@ -742,11 +742,20 @@ async def kasera(method, path, headers=None, **kw):
     try:
         async with http.request(method, "https://pay.kasera.id" + path, timeout=aiohttp.ClientTimeout(total=20),
                                 headers={"Authorization": f"Bearer {KASERA_KEY}", **(headers or {})}, **kw) as resp:
-            j, status = await resp.json(), resp.status
+            status = resp.status
+            try:
+                j = await resp.json()
+            except Exception:
+                j = {"raw": (await resp.text())[:500]}
     except Exception as e:
-        log.warning("Kasera %s gagal: %s", path, e)
-        return None, "network"
-    return (j, None) if status < 300 else (None, j.get("error", {}).get("code", "error"))
+        log.warning("Kasera %s %s gagal (exception): %s", method, path, e)
+        return None, f"network: {e}"
+    if status < 300:
+        return j, None
+    detail = j.get("error", {}) if isinstance(j, dict) else {}
+    code = detail.get("code") or detail.get("message") or j.get("raw") or f"HTTP {status}"
+    log.warning("Kasera %s %s gagal (HTTP %s): %s", method, path, status, j)
+    return None, str(code)
 
 def qr_png(data):
     buf = io.BytesIO()
@@ -779,6 +788,12 @@ async def kasera_invoice(target, uid, amount):
                                  "description": f"Deposit #{did}", "expires_in_minutes": 30})
     if err:
         await run("UPDATE deposits SET status='FAILED' WHERE id=?", (did,))
+        log.warning("Gagal membuat invoice Kasera untuk deposit #%s: %s", did, err)
+        for a in ADMINS:
+            try:
+                await msg.bot.send_message(a, f"⚠️ Gagal membuat invoice Kasera (deposit #{did}):\n<code>{esc(err)}</code>")
+            except Exception:
+                pass
         return await msg.answer("😕 Gagal membuat invoice, coba lagi sebentar lagi.")
     await run("UPDATE deposits SET kasera_id=? WHERE id=?", (tx["id"], did))
     text = (f"🧾 <b>INVOICE TOP UP #{did}</b>\n{LINE}\n"
