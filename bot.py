@@ -26,6 +26,7 @@ MARKUP = float(os.getenv("MARKUP_PERCENT", "30"))
 STORE = os.getenv("STORE_NAME", "OTP Store")
 PAY_INFO = os.getenv("PAYMENT_INFO", "Hubungi admin untuk metode pembayaran.").replace("\\n", "\n")
 MIN_DEP = int(os.getenv("MIN_DEPOSIT", "2000"))
+DB_PATH = os.getenv("DB_PATH", "store.db")                    # di Railway: isi mis. /data/store.db (path di dalam Volume)
 AUTO_CANCEL = int(os.getenv("AUTO_CANCEL_MIN", "10")) * 60
 KASERA_KEY = os.getenv("KASERA_API_KEY", "")          # kp_test_... atau kp_live_...
 WH_SECRET = os.getenv("KASERA_WEBHOOK_SECRET", "")    # signing secret endpoint webhook
@@ -1453,9 +1454,12 @@ async def autobroadcast_callback(cb: CallbackQuery, bot: Bot):
 
 async def main():
     global db, http
-    db = await aiosqlite.connect("store.db")
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    db = await aiosqlite.connect(DB_PATH)
     db.row_factory = aiosqlite.Row
     await init_db()
+    _n = (await one("SELECT COUNT(*) c FROM users"))["c"]
+    log.info("Database: %s (%s user terdaftar)", os.path.abspath(DB_PATH), _n)
     http = aiohttp.ClientSession()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     err = await check_channel(bot)
