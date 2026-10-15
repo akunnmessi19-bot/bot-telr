@@ -49,6 +49,9 @@ CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()           # link channel (ops
 # Bot WAJIB dijadikan admin di channel tsb. Kosongkan ("") untuk mematikan fitur wajib join.
 gateway_channel = os.getenv("GATEWAY_CHANNEL", "").strip()
 gateway_channel_url = os.getenv("GATEWAY_CHANNEL_URL", "").strip()   # opsional, link undangan untuk channel privat
+# Channel ke-2 (Monitoring) - opsional. Kalau diisi, user wajib join KEDUA channel. Kosongkan untuk hanya pakai 1 channel.
+gateway_channel_2 = os.getenv("GATEWAY_CHANNEL_2", "").strip()
+gateway_channel_2_url = os.getenv("GATEWAY_CHANNEL_2_URL", "").strip()   # opsional, link undangan untuk channel privat
 PER_PAGE = 7
 REF_PERCENT = float(os.getenv("REF_PERCENT", "5"))          # komisi referral (% dari harga order yang OTP-nya masuk)
 REF_MIN_WD = int(os.getenv("REF_MIN_WD", "5000"))            # minimal penarikan saldo referral
@@ -385,35 +388,54 @@ async def refresh_card(bot, o):
             log.warning("refresh_card gagal: %s", e)
 
 
-# ---------- wajib join channel ----------
-async def is_joined(bot: Bot, uid):
-    if not gateway_channel or uid in ADMINS:
-        return True
-    try:
-        m = await bot.get_chat_member(gateway_channel, uid)
-        return m.status in ("member", "administrator", "creator", "restricted")
-    except Exception as e:
-        log.warning("cek join gateway_channel gagal: %s", e)
-        return True   # jangan kunci user kalau bot belum admin / channel salah
+# ---------- wajib join channel (bisa 2 channel: Utama + Monitoring) ----------
+def gateways():
+    """Daftar channel wajib join yang aktif."""
+    g = []
+    if gateway_channel:
+        g.append({"id": gateway_channel, "url": gateway_channel_url, "label": "Channel Utama", "emoji": "📢"})
+    if gateway_channel_2:
+        g.append({"id": gateway_channel_2, "url": gateway_channel_2_url, "label": "Channel Monitoring", "emoji": "📡"})
+    return g
 
-def join_url():
-    if gateway_channel_url: return gateway_channel_url
-    c = str(gateway_channel)
+def gw_url(g):
+    if g["url"]: return g["url"]
+    c = str(g["id"])
     return f"https://t.me/{c.lstrip('@')}" if c.startswith("@") else None
 
-def join_text(name, failed=False):
+async def missing_channels(bot: Bot, uid):
+    """Channel wajib yang BELUM di-join user."""
+    if uid in ADMINS: return []
+    miss = []
+    for g in gateways():
+        try:
+            m = await bot.get_chat_member(g["id"], uid)
+            if m.status not in ("member", "administrator", "creator", "restricted"):
+                miss.append(g)
+        except Exception as e:
+            log.warning("cek join %s gagal: %s", g["label"], e)   # jangan kunci user kalau bot belum admin / channel salah
+    return miss
+
+async def is_joined(bot: Bot, uid):
+    return not await missing_channels(bot, uid)
+
+def join_text(name, missing, failed=False):
+    names = " dan ".join(f"<b>{g['label']}</b>" for g in missing)
+    n = len(missing)
+    steps = "\n".join(f"{i}️⃣ Klik <b>{g['emoji']} Join {g['label']}</b>" for i, g in enumerate(missing, 1))
     t = (f"🔒 <b>AKSES TERKUNCI</b>\n{LINE}\n"
          f"Halo <b>{esc(name)}</b>! 👋\n\n"
-         f"<blockquote>📢 Untuk menggunakan bot ini, kamu wajib join channel resmi kami terlebih dahulu.\n\n"
-         f"1️⃣ Klik <b>📢 Join Channel</b>\n2️⃣ Setelah join, klik <b>🔄 Refresh / Sudah Join</b></blockquote>")
+         f"<blockquote>📢 Untuk menggunakan bot ini, kamu wajib join {'<b>' + str(n) + ' channel</b> kami' if n > 1 else 'channel resmi kami'} "
+         f"terlebih dahulu: {names}.\n\n{steps}\n{n + 1}️⃣ Setelah join, klik <b>🔄 Refresh / Sudah Join</b></blockquote>")
     if failed:
-        t += "\n❌ <b>Kamu belum terdeteksi join.</b> Silakan join dulu lalu tekan refresh."
+        t += f"\n❌ <b>Kamu belum terdeteksi join</b> {names}. Silakan join dulu lalu tekan refresh."
     return t
 
-def join_kb():
+def join_kb(missing):
     rows = []
-    if (u := join_url()):
-        rows.append([InlineKeyboardButton(text="📢 Join Channel", url=u)])
+    for g in missing:
+        if (u := gw_url(g)):
+            rows.append([InlineKeyboardButton(text=f"{g['emoji']} Join {g['label']}", url=u)])
     rows.append([b("🔄 Refresh / Sudah Join", "jc")])
     return kb(rows)
 
@@ -429,29 +451,31 @@ class JoinGate:
                 log.exception("catat referral gagal")
         if isinstance(event, Message) and event.chat.type != "private":
             return await handler(event, data)
-        if await is_joined(data["bot"], u.id):
+        miss = await missing_channels(data["bot"], u.id)
+        if not miss:
             return await handler(event, data)
         if isinstance(event, CallbackQuery):
             await event.answer("🔒 Join channel dulu ya!", show_alert=True)
-            await event.message.answer(join_text(u.full_name), reply_markup=join_kb())
+            await event.message.answer(join_text(u.full_name, miss), reply_markup=join_kb(miss))
         else:
-            await event.answer(join_text(u.full_name), reply_markup=join_kb())
+            await event.answer(join_text(u.full_name, miss), reply_markup=join_kb(miss))
 
 r.message.outer_middleware(JoinGate())
 r.callback_query.outer_middleware(JoinGate())
 
 @r.callback_query(F.data == "jc")
 async def join_check(cb: CallbackQuery, bot: Bot, state: FSMContext):
-    if not await is_joined(bot, cb.from_user.id):
-        await cb.answer("❌ Kamu belum join channel.", show_alert=True)
+    miss = await missing_channels(bot, cb.from_user.id)
+    if miss:
+        await cb.answer("❌ Kamu belum join " + " & ".join(g["label"] for g in miss) + ".", show_alert=True)
         try:
-            await cb.message.edit_text(join_text(cb.from_user.full_name, True), reply_markup=join_kb())
+            await cb.message.edit_text(join_text(cb.from_user.full_name, miss, True), reply_markup=join_kb(miss))
         except TelegramBadRequest:
             pass
         return
     await cb.answer("✅ Terima kasih sudah join!", show_alert=True)
     try:
-        await cb.message.edit_text(f"✅ <b>VERIFIKASI BERHASIL</b>\n{LINE}\n<blockquote>🎉 Kamu sudah join channel. Selamat menggunakan bot!</blockquote>")
+        await cb.message.edit_text(f"✅ <b>VERIFIKASI BERHASIL</b>\n{LINE}\n<blockquote>🎉 Kamu sudah join semua channel wajib. Selamat menggunakan bot!</blockquote>")
     except TelegramBadRequest:
         pass
     await state.clear()
