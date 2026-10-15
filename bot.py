@@ -1,6 +1,7 @@
 """Bot Telegram toko nomor virtual - SMSCode API v1 (IDR). Python 3.10+ / aiogram 3."""
-import asyncio, base64, hashlib, hmac, html, io, json, logging, math, os, random, shutil, sqlite3, tempfile, time, uuid
+import asyncio, base64, re, hashlib, hmac, html, io, json, logging, math, os, random, shutil, sqlite3, tempfile, time, uuid
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote as urlquote
 import aiohttp, aiosqlite, qrcode
 from aiohttp import web
 from dotenv import load_dotenv
@@ -49,6 +50,11 @@ CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()           # link channel (ops
 gateway_channel = os.getenv("GATEWAY_CHANNEL", "").strip()
 gateway_channel_url = os.getenv("GATEWAY_CHANNEL_URL", "").strip()   # opsional, link undangan untuk channel privat
 PER_PAGE = 7
+REF_PERCENT = float(os.getenv("REF_PERCENT", "5"))          # komisi referral (% dari harga order yang OTP-nya masuk)
+REF_MIN_WD = int(os.getenv("REF_MIN_WD", "5000"))            # minimal penarikan saldo referral
+REF_GOPAY_FEE = int(os.getenv("REF_GOPAY_FEE", "1000"))      # biaya admin tarik ke GoPay
+WD_CHANNEL_ID = os.getenv("WD_CHANNEL_ID", "").strip()       # tujuan laporan penarikan: ID numerik (-100...) atau @username channel publik
+WD_CHANNEL_URL = os.getenv("WD_CHANNEL_URL", "").strip()     # opsional; dipakai hanya jika WD_CHANNEL_ID kosong (hanya bisa dibaca bila link publik / t.me/c/<id>/..)
 SR_MIN = 5                                                   # minimal transaksi agar SR ditampilkan
 PRIO_COUNTRIES = ["PH", "ID", "BR", "CL", "ZA"]              # selalu di atas pada halaman 1
 EXACT_30 = {"BR", "CL"}                                      # harga jual = modal x 1.30 persis
@@ -123,10 +129,16 @@ async def init_db():
     CREATE TABLE IF NOT EXISTS deposits(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
         amount INTEGER, total INTEGER, status TEXT DEFAULT 'PENDING', created REAL);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS referrals(referred_id INTEGER PRIMARY KEY, referrer_id INTEGER, created REAL);
+    CREATE INDEX IF NOT EXISTS idx_ref_referrer ON referrals(referrer_id);
+    CREATE TABLE IF NOT EXISTS ref_commissions(order_id INTEGER PRIMARY KEY, referrer_id INTEGER, referred_id INTEGER,
+        amount INTEGER, created REAL);
+    CREATE TABLE IF NOT EXISTS withdrawals(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER,
+        method TEXT, account TEXT, holder TEXT, fee INTEGER DEFAULT 0, status TEXT DEFAULT 'PENDING', created REAL);
     """)
     for tbl, col in [("deposits", "kasera_id TEXT"), ("orders", "sid INTEGER"), ("orders", "cid INTEGER"), ("orders", "oid INTEGER"),
                      ("orders", "svc TEXT"), ("orders", "ctry TEXT"), ("orders", "code TEXT"), ("orders", "msg TEXT"),
-                     ("orders", "ph INTEGER")]:
+                     ("orders", "ph INTEGER"), ("users", "ref_balance INTEGER DEFAULT 0"), ("withdrawals", "chan_msg INTEGER")]:
         try:
             await db.execute(f"ALTER TABLE {tbl} ADD COLUMN {col}")
         except Exception:
@@ -259,7 +271,8 @@ def banner():
 def menu_kb():
     rows = [[b("📱 Beli Nomor Virtual", "sv:0")],
             [b("💳 Top Up Saldo", "dep"), b("👤 Akun Saya", "me")],
-            [b("📜 Riwayat", "hist"), b("🛟 Bantuan", "help")]]
+            [b("📜 Riwayat", "hist"), b("🛟 Bantuan", "help")],
+            [b("🎁 Referral", "ref")]]
     if CHANNEL_URL:
         rows.append([InlineKeyboardButton(text="📡 Live OTP Channel", url=CHANNEL_URL)])
     return kb(rows)
@@ -409,6 +422,11 @@ class JoinGate:
         u = getattr(event, "from_user", None)
         if not u or (isinstance(event, CallbackQuery) and event.data == "jc"):
             return await handler(event, data)
+        if isinstance(event, Message) and event.chat.type == "private" and (event.text or "").startswith("/start"):
+            try:
+                await register_ref(u.id, event.text)   # dicatat dulu, supaya tidak hilang walau user tertahan gerbang join
+            except Exception:
+                log.exception("catat referral gagal")
         if isinstance(event, Message) and event.chat.type != "private":
             return await handler(event, data)
         if await is_joined(data["bot"], u.id):
@@ -547,6 +565,292 @@ async def help_(cb: CallbackQuery):
                    f"3️⃣ Gunakan nomor di aplikasi tujuan\n4️⃣ Kode OTP muncul otomatis di sini</blockquote>\n"
                    f"♻️ <i>OTP tidak masuk? Pesanan dibatalkan otomatis dan saldo kembali.</i>",
                kb([[b("🏠 Menu Utama", "home")]]))
+
+
+# ---------- referral (komisi per OTP sukses + penarikan) ----------
+# User A bagikan link t.me/<bot>?start=ref_<id A>. User B (BARU) membuka link -> tercatat sebagai teman A.
+# Tiap order B yang OTP-nya masuk -> A dapat REF_PERCENT% dari harga order ke SALDO REFERRAL (sekali per order).
+# Saldo referral dicairkan lewat penarikan manual (admin setujui/tolak).
+_BOT_USER = None
+
+class Wd(StatesGroup):
+    form = State()
+
+async def bot_username(bot: Bot):
+    global _BOT_USER
+    if not _BOT_USER:
+        _BOT_USER = (await bot.me()).username
+    return _BOT_USER
+
+async def ref_bal(uid):
+    await balance(uid)
+    return (await one("SELECT COALESCE(ref_balance,0) b FROM users WHERE id=?", (uid,)))["b"]
+
+async def register_ref(uid, text):
+    """Catat pengajak dari payload /start. Hanya user baru; pengajak pertama yang dipakai."""
+    parts = (text or "").split(maxsplit=1)
+    if len(parts) < 2: return
+    p = parts[1].strip().lower()
+    for pre in ("ref_", "ref"):
+        if p.startswith(pre):
+            p = p[len(pre):]
+            break
+    if not p.isdigit(): return
+    ref = int(p)
+    if ref == uid: return
+    if await one("SELECT 1 x FROM users WHERE id=?", (uid,)): return          # sudah pernah pakai bot = bukan user baru
+    if not await one("SELECT 1 x FROM users WHERE id=?", (ref,)): return       # pengajak harus user bot ini
+    await run("INSERT OR IGNORE INTO referrals(referred_id,referrer_id,created) VALUES(?,?,?)", (uid, ref, time.time()))
+
+async def ref_commission(bot: Bot, o):
+    """Dipanggil saat OTP masuk. Komisi dicatat per order (idempotent) lalu masuk ke saldo referral pengajak."""
+    rf = await one("SELECT referrer_id FROM referrals WHERE referred_id=?", (o["user_id"],))
+    if not rf: return
+    amt = int(o["price"] * REF_PERCENT / 100)
+    if amt <= 0: return
+    cur = await db.execute("INSERT OR IGNORE INTO ref_commissions(order_id,referrer_id,referred_id,amount,created) VALUES(?,?,?,?,?)",
+                           (o["id"], rf["referrer_id"], o["user_id"], amt, time.time()))
+    await db.commit()
+    if cur.rowcount == 0: return                                               # order ini sudah pernah dikomisikan
+    await run("UPDATE users SET ref_balance=COALESCE(ref_balance,0)+? WHERE id=?", (amt, rf["referrer_id"]))
+    try:
+        await bot.send_message(rf["referrer_id"],
+                               f"💰 <b>KOMISI REFERRAL</b>\n{LINE}\n<blockquote>Teman kamu berhasil membeli nokos "
+                               f"({rp(o['price'])}).\nKomisi <b>+{rp(amt)}</b> masuk ke saldo referral.</blockquote>")
+    except Exception:
+        log.warning("gagal kirim notifikasi komisi ke %s", rf["referrer_id"])
+
+def ref_text(link, st, bal, friends, more):
+    body = "\n".join(friends) or "<i>Belum ada teman yang diundang.</i>"
+    return (f"👥 <b>PROGRAM REFERRAL BOT NOKOS</b> 👥\n\n"
+            f"Mau dapat penghasilan tambahan? Cukup bagikan link referral Anda dan dapatkan keuntungan dari setiap "
+            f"transaksi teman yang Anda undang!\n\n"
+            f"💰 <b>Komisi Anda: {REF_PERCENT:g}%</b> dari total harga belanja teman (Real-Time per OTP Sukses!)\n"
+            f"<i>Contoh: Teman Anda beli nokos seharga {rp(10000)}, Anda LANGSUNG dapat {rp(10000 * REF_PERCENT / 100)}!</i>\n\n"
+            f"🔗 <b>Link Referral Anda:</b>\n<code>{link}</code>\n\n"
+            f"📊 <b>Statistik Anda:</b>\n"
+            f"• Total Teman Diundang: <b>{st['friends']}</b> orang\n"
+            f"• Total Transaksi Sukses: <b>{st['trx']}</b> kali\n"
+            f"• Saldo Referral Saat Ini: <b>{rp(bal)}</b>\n\n"
+            f"💳 <b>KETENTUAN WITHDRAW (PENARIKAN):</b>\n"
+            f"1. Minimal penarikan saldo adalah {rp(REF_MIN_WD)}\n"
+            f"2. Penarikan diproses secara MANUAL oleh admin untuk menjamin keamanan &amp; potongan biaya termurah.\n"
+            f"3. Metode Penarikan:\n"
+            f"   • Tarik Jadi Saldo Bot (GRATIS / Tanpa Potongan Admin)\n"
+            f"   • Tarik Ke DANA (GRATIS Biaya Admin!)\n"
+            f"   • Tarik Ke GoPay (Biaya Admin {rp(REF_GOPAY_FEE)})\n\n"
+            f"👇 Silakan klik tombol di bawah ini jika saldo Anda sudah mencukupi. Penarikan diproses dalam 1-24 jam.\n\n"
+            f"👥 <b>Daftar Teman:</b>\n<blockquote expandable>{body}{more}</blockquote>")
+
+@r.callback_query(F.data == "ref")
+async def referral(cb: CallbackQuery, bot: Bot, state: FSMContext):
+    await state.clear()
+    await cb.answer()
+    uid = cb.from_user.id
+    bal = await ref_bal(uid)
+    link = f"https://t.me/{await bot_username(bot)}?start=ref_{uid}"
+    st = {"friends": (await one("SELECT COUNT(*) c FROM referrals WHERE referrer_id=?", (uid,)))["c"],
+          "trx": (await one("SELECT COUNT(*) c FROM ref_commissions WHERE referrer_id=?", (uid,)))["c"]}
+    rows = await fetch("SELECT r.referred_id id, u.name, "
+                       "(SELECT COUNT(*) FROM ref_commissions c WHERE c.referred_id=r.referred_id) n, "
+                       "(SELECT COALESCE(SUM(amount),0) FROM ref_commissions c WHERE c.referred_id=r.referred_id) earned "
+                       "FROM referrals r LEFT JOIN users u ON u.id=r.referred_id WHERE r.referrer_id=? "
+                       "ORDER BY r.created DESC LIMIT 15", (uid,))
+    friends = [f"👤 <b>{esc(x['name'] or x['id'])}</b> · {x['n']} trx · {rp(x['earned'])}" for x in rows]
+    more = f"\n<i>+ {st['friends'] - len(rows)} lainnya</i>" if st["friends"] > len(rows) else ""
+    share = "https://t.me/share/url?url=" + urlquote(link) + "&text=" + urlquote("Beli nomor virtual OTP otomatis di sini 👇")
+    await show_any(cb, ref_text(link, st, bal, friends, more),
+                   kb([[b("💸 Tarik Saldo Referral", "refwd")],
+                       [InlineKeyboardButton(text="📤 Bagikan Link", url=share)],
+                       [b("🏠 Menu Utama", "home")]]))
+
+@r.callback_query(F.data == "refwd")
+async def ref_wd(cb: CallbackQuery, state: FSMContext):
+    bal = await ref_bal(cb.from_user.id)
+    if bal < REF_MIN_WD:
+        return await cb.answer(f"Saldo referral kamu {rp(bal)}. Minimal penarikan {rp(REF_MIN_WD)}.", show_alert=True)
+    await cb.answer()
+    await state.set_state(Wd.form)
+    await cb.message.answer(
+        f"💸 <b>FORMULIR PENARIKAN SALDO REFERRAL</b> 💸\n\n"
+        f"Saldo Anda saat ini: <b>{rp(bal)}</b>\n\n"
+        f"Silakan balas pesan ini dengan format berikut untuk memproses penarikan:\n\n"
+        f"<code>PILIHAN_METODE / NOMOR_E-WALLET / NAMA_PEMILIK_AKUN</code>\n\n"
+        f"<b>Contoh Ke DANA:</b>\n<code>DANA / 081234567890 / Budi Santoso</code>\n\n"
+        f"<b>Contoh Ke GoPay:</b>\n<code>GOPAY / 081234567890 / Budi Santoso</code>\n\n"
+        f"<b>Contoh Ke Saldo Bot:</b>\n<code>SALDO BOT / [Ketik: MASUKKAN KE SALDO BOT]</code>\n\n"
+        f"⚠️ Pastikan nomor dan nama e-wallet sudah benar. Kesalahan input bukan tanggung jawab admin!",
+        reply_markup=kb([[b("❌ Batal", "ref")]]))
+
+_wd_warned = False
+
+def wd_chan_target():
+    """Tentukan chat tujuan laporan WD. Bot hanya bisa kirim ke ID numerik atau @username, bukan link undangan privat."""
+    v = WD_CHANNEL_ID
+    if v:
+        return int(v) if v.lstrip("-").isdigit() else (v if v.startswith("@") else "@" + v)
+    u = WD_CHANNEL_URL
+    if not u: return None
+    m = re.search(r"t\.me/c/(\d+)", u)
+    if m: return int("-100" + m.group(1))
+    m = re.search(r"t\.me/([A-Za-z][A-Za-z0-9_]{3,})", u)
+    if m and m.group(1).lower() not in ("joinchat", "c", "s"): return "@" + m.group(1)
+    if u.startswith("@"): return u
+    return None
+
+WD_STATUS = {"PENDING": "⏳ Pending", "DONE": "✅ Berhasil (Disetujui)", "REJECTED": "❌ Ditolak"}
+
+def wd_chan_text(w, status):
+    wallet = "Saldo Bot" if w["method"] == "SALDO BOT" else f"{w['method']} · <code>{esc(mask_phone(w['account']))}</code>"
+    return (f"💸 <b>PENARIKAN REFERRAL #{w['id']}</b>\n{LINE}\n"
+            f"🆔 ID User: <code>{w['user_id']}</code>\n"
+            f"💰 Total Penarikan: <b>{rp(w['amount'])}</b>\n"
+            f"🏦 E-Wallet: {wallet}\n"
+            f"✂️ Biaya: {rp(w['fee'])} · Diterima: <b>{rp(w['amount'] - w['fee'])}</b>\n"
+            f"📌 Status: <b>{WD_STATUS.get(status, status)}</b>\n"
+            f"🕒 {_tgl(w.get('created') or time.time())}")
+
+async def wd_chan_post(bot: Bot, w, status="PENDING"):
+    """Kirim laporan WD ke channel; kalau sudah pernah dikirim, edit pesan lama (update status)."""
+    global _wd_warned
+    t = wd_chan_target()
+    if t is None:
+        if (WD_CHANNEL_ID or WD_CHANNEL_URL) and not _wd_warned:
+            _wd_warned = True
+            for a in ADMINS:
+                try:
+                    await bot.send_message(a, "⚠️ Laporan WD ke channel belum bisa dikirim: link privat tidak bisa dipakai bot. "
+                                              "Isi env <code>WD_CHANNEL_ID</code> dengan ID channel (contoh -1001234567890).")
+                except Exception: pass
+        return
+    try:
+        if w.get("chan_msg"):
+            await bot.edit_message_text(wd_chan_text(w, status), chat_id=t, message_id=w["chan_msg"])
+        else:
+            sent = await bot.send_message(t, wd_chan_text(w, status))
+            await run("UPDATE withdrawals SET chan_msg=? WHERE id=?", (sent.message_id, w["id"]))
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e): log.warning("laporan WD ke channel gagal: %s", e)
+    except Exception as e:
+        log.warning("laporan WD ke channel gagal: %s", e)
+
+def wd_admin_text(w, name):
+    net = w["amount"] - w["fee"]
+    t = (f"💸 <b>PERMINTAAN PENARIKAN #{w['id']}</b>\n{LINE}\n👤 {esc(name)} (<code>{w['user_id']}</code>)\n"
+         f"🏦 Metode: <b>{esc(w['method'])}</b>\n")
+    if w["method"] != "SALDO BOT":
+        t += f"📱 Nomor: <code>{esc(w['account'])}</code>\n🧾 A/N: {esc(w['holder'])}\n"
+    t += f"💰 Jumlah: {rp(w['amount'])}\n✂️ Biaya: {rp(w['fee'])}\n✅ <b>Dikirim: {rp(net)}</b>"
+    return t
+
+@r.message(Wd.form, F.text, ~F.text.startswith("/"))
+async def ref_wd_submit(m: Message, state: FSMContext, bot: Bot):
+    uid = m.from_user.id
+    parts = [p.strip() for p in m.text.split("/")]
+    method = " ".join(parts[0].upper().split())
+    retry = kb([[b("❌ Batal", "ref")]])
+    if method not in ("DANA", "GOPAY", "SALDO BOT"):
+        return await m.answer("❌ Metode tidak dikenal. Pilih: <b>DANA</b>, <b>GOPAY</b>, atau <b>SALDO BOT</b>. Coba kirim ulang.", reply_markup=retry)
+    acc = holder = ""
+    if method != "SALDO BOT":
+        acc = re.sub(r"[\s\-+]", "", parts[1]) if len(parts) > 1 else ""
+        holder = parts[2] if len(parts) > 2 else ""
+        if not (acc.isdigit() and 9 <= len(acc) <= 15 and holder):
+            return await m.answer("❌ Format salah. Contoh:\n<code>DANA / 081234567890 / Budi Santoso</code>", reply_markup=retry)
+    amount = await ref_bal(uid)
+    if amount < REF_MIN_WD:
+        await state.clear()
+        return await m.answer(f"❌ Saldo referral {rp(amount)}, minimal penarikan {rp(REF_MIN_WD)}.")
+    fee = REF_GOPAY_FEE if method == "GOPAY" else 0
+    if await run("UPDATE users SET ref_balance=ref_balance-? WHERE id=? AND ref_balance>=?", (amount, uid, amount)) == 0:
+        await state.clear()
+        return await m.answer("❌ Saldo tidak mencukupi.")
+    cur = await db.execute("INSERT INTO withdrawals(user_id,amount,method,account,holder,fee,created) VALUES(?,?,?,?,?,?,?)",
+                           (uid, amount, method, acc, holder, fee, time.time()))
+    await db.commit()
+    await state.clear()
+    w = {"id": cur.lastrowid, "user_id": uid, "amount": amount, "method": method, "account": acc, "holder": holder, "fee": fee,
+         "created": time.time()}
+    await wd_chan_post(bot, w, "PENDING")
+    await m.answer(f"✅ <b>Permintaan penarikan #{w['id']} diterima</b>\n{LINE}\n<blockquote>🏦 {esc(method)}\n"
+                   f"💰 {rp(amount)} (biaya {rp(fee)})\n⏳ Diproses admin dalam 1-24 jam.</blockquote>",
+                   reply_markup=kb([[b("🎁 Menu Referral", "ref")], [b("🏠 Menu Utama", "home")]]))
+    for a in ADMINS:
+        try:
+            await bot.send_message(a, wd_admin_text(w, m.from_user.full_name),
+                                   reply_markup=kb([[b("✅ Setujui", f"wdok:{w['id']}"), b("❌ Tolak", f"wdno:{w['id']}")]]))
+        except Exception:
+            log.warning("gagal kirim permintaan WD ke admin %s", a)
+
+@r.callback_query(F.data.startswith(("wdok:", "wdno:")))
+async def wd_decide(cb: CallbackQuery, bot: Bot):
+    if cb.from_user.id not in ADMINS:
+        return await cb.answer("Khusus admin.", show_alert=True)
+    act, wid = cb.data.split(":")
+    w = await one("SELECT * FROM withdrawals WHERE id=?", (int(wid),))
+    if not w:
+        return await cb.answer("Data tidak ditemukan.", show_alert=True)
+    ok = act == "wdok"
+    if await run("UPDATE withdrawals SET status=? WHERE id=? AND status='PENDING'", ("DONE" if ok else "REJECTED", w["id"])) == 0:
+        return await cb.answer("Sudah diproses sebelumnya.", show_alert=True)
+    net = w["amount"] - w["fee"]
+    if ok:
+        if w["method"] == "SALDO BOT":
+            await credit(w["user_id"], w["amount"])
+        msg = (f"✅ <b>Penarikan #{w['id']} disetujui</b>\n<blockquote>"
+               + (f"{rp(w['amount'])} sudah masuk ke saldo bot kamu." if w["method"] == "SALDO BOT"
+                  else f"{rp(net)} dikirim ke {esc(w['method'])} {esc(w['account'])}.") + "</blockquote>")
+    else:
+        await run("UPDATE users SET ref_balance=COALESCE(ref_balance,0)+? WHERE id=?", (w["amount"], w["user_id"]))
+        msg = f"❌ <b>Penarikan #{w['id']} ditolak</b>\n<blockquote>{rp(w['amount'])} dikembalikan ke saldo referral kamu. Hubungi admin jika ada pertanyaan.</blockquote>"
+    try:
+        await bot.send_message(w["user_id"], msg)
+    except Exception:
+        log.warning("gagal kabari user %s soal WD", w["user_id"])
+    await wd_chan_post(bot, w, "DONE" if ok else "REJECTED")
+    await cb.answer("Disetujui" if ok else "Ditolak")
+    try:
+        await cb.message.edit_text(cb.message.html_text + f"\n\n{'✅ DISETUJUI' if ok else '❌ DITOLAK'} oleh {esc(cb.from_user.full_name)}")
+    except TelegramBadRequest:
+        pass
+
+@r.message(Command("wdlist"))
+async def wdlist(m: Message):
+    if m.from_user.id not in ADMINS: return
+    rows = await fetch("SELECT w.*, u.name FROM withdrawals w LEFT JOIN users u ON u.id=w.user_id WHERE w.status='PENDING' ORDER BY w.id LIMIT 20")
+    if not rows: return await m.answer("Tidak ada penarikan yang menunggu.")
+    for w in rows:
+        await m.answer(wd_admin_text(w, w["name"] or w["user_id"]),
+                       reply_markup=kb([[b("✅ Setujui", f"wdok:{w['id']}"), b("❌ Tolak", f"wdno:{w['id']}")]]))
+
+@r.message(Command("setref"))
+async def setref(m: Message):
+    """Admin: /setref <id_pengajak> <id_user1> [id_user2 ...] - hubungkan teman lama secara manual (komisi berlaku untuk transaksi berikutnya)."""
+    if m.from_user.id not in ADMINS: return
+    a = m.text.split()[1:]
+    if len(a) < 2 or not all(x.isdigit() for x in a):
+        return await m.answer("Format: /setref id_pengajak id_user1 [id_user2 ...]")
+    ref, ids = int(a[0]), [int(x) for x in a[1:]]
+    if not await one("SELECT 1 x FROM users WHERE id=?", (ref,)):
+        return await m.answer("❌ ID pengajak tidak ada di database.")
+    ok, skip = 0, []
+    for uid in ids:
+        if uid == ref or not await one("SELECT 1 x FROM users WHERE id=?", (uid,)) \
+                or await one("SELECT 1 x FROM referrals WHERE referred_id=?", (uid,)):
+            skip.append(uid); continue
+        await run("INSERT INTO referrals(referred_id,referrer_id,created) VALUES(?,?,?)", (uid, ref, time.time()))
+        ok += 1
+    await m.answer(f"✅ Tercatat: {ok}" + (f"\n⚠️ Dilewati (tidak ada di DB / sudah punya pengajak / diri sendiri): {', '.join(map(str, skip))}" if skip else ""))
+
+@r.message(Command("refstats"))
+async def refstats(m: Message):
+    if m.from_user.id not in ADMINS: return
+    rows = await fetch("SELECT r.referrer_id id, u.name, COUNT(*) n, COALESCE(u.ref_balance,0) bal, "
+                       "(SELECT COALESCE(SUM(amount),0) FROM ref_commissions c WHERE c.referrer_id=r.referrer_id) earned "
+                       "FROM referrals r LEFT JOIN users u ON u.id=r.referrer_id GROUP BY r.referrer_id ORDER BY earned DESC, n DESC LIMIT 15")
+    if not rows: return await m.answer("Belum ada data referral.")
+    lines = [f"• <b>{esc(x['name'] or x['id'])}</b> (<code>{x['id']}</code>) · teman {x['n']} · komisi {rp(x['earned'])} · saldo {rp(x['bal'])}" for x in rows]
+    await m.answer(f"🎁 <b>STATISTIK REFERRAL</b>\n{LINE}\n" + "\n".join(lines))
 
 
 # ---------- beli nomor: LAYANAN -> NEGARA -> DAFTAR NOMOR (+ operator opsional) ----------
@@ -1022,7 +1326,7 @@ async def admin(m: Message):
     o = await one("SELECT COUNT(*) c, COALESCE(SUM(price),0) s FROM orders WHERE refunded=0")
     await m.answer(f"🛠 <b>Admin</b>\n{LINE}\n👥 User: {u}\n🧾 Order sukses/aktif: {o['c']}\n💵 Omzet: {rp(o['s'])}\n"
                    f"🏦 Saldo SMSCode: {rp(d['balance']) if d else 'n/a'}\n\n"
-                   f"/addsaldo &lt;user_id&gt; &lt;nominal&gt;\n/broadcast &lt;pesan&gt; (manual ke user)\n/trafik (laporan trafik, HANYA ke channel)\n/autobroadcast (promosi harga termurah, HANYA ke user)\n/testchannel\n/backup (kirim file database ke chat ini)\n/restore (kirim file .db dengan caption /restore)")
+                   f"/addsaldo &lt;user_id&gt; &lt;nominal&gt;\n/wdlist (penarikan referral menunggu)\n/setref &lt;id_pengajak&gt; &lt;id_user...&gt;\n/refstats\n/broadcast &lt;pesan&gt; (manual ke user)\n/trafik (laporan trafik, HANYA ke channel)\n/autobroadcast (promosi harga termurah, HANYA ke user)\n/testchannel\n/backup (kirim file database ke chat ini)\n/restore (kirim file .db dengan caption /restore)")
 
 @r.message(Command("addsaldo"))
 async def addsaldo(m: Message):
@@ -1130,6 +1434,10 @@ async def poll(bot: Bot):
                 except Exception:
                     log.warning("gagal kirim OTP ke user %s", o["user_id"])
                 await monitor(bot, o)
+                try:
+                    await ref_commission(bot, o)
+                except Exception:
+                    log.exception("komisi referral gagal")
             elif o["status"] == "ACTIVE" and time.time() - o["created"] > AUTO_CANCEL:
                 _, err = await api("POST", "/orders/cancel", json={"id": o["id"]})
                 if not err and (done := await refund(o["id"], "CANCELED")):
