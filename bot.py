@@ -1,5 +1,5 @@
 """Bot Telegram toko nomor virtual - SMSCode API v1 (IDR). Python 3.10+ / aiogram 3."""
-import asyncio, base64, re, hashlib, hmac, html, io, json, logging, math, os, random, shutil, sqlite3, tempfile, time, uuid
+import asyncio, base64, csv, re, hashlib, hmac, html, io, json, logging, math, os, random, shutil, sqlite3, tempfile, time, uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote as urlquote
 import aiohttp, aiosqlite, qrcode
@@ -1118,9 +1118,36 @@ async def old_menu(cb: CallbackQuery):
 class Dep(StatesGroup):
     amount = State()
 
+# ---------- buka / tutup top up (maintenance) ----------
+async def topup_open():
+    row = await one("SELECT value FROM settings WHERE key='topup_on'")
+    return row is None or row["value"] != "0"          # default: terbuka
+
+async def set_topup_open(on):
+    await run("INSERT OR REPLACE INTO settings(key,value) VALUES('topup_on',?)", ("1" if on else "0",))
+
+MAINT_TOPUP = (f"🛠 <b>TOP UP SEDANG MAINTENANCE</b>\n{LINE}\n"
+               f"<blockquote>Sistem top up sedang kami rapikan sebentar.\n"
+               f"💵 Saldo kamu tetap aman\n🛒 Beli nomor tetap bisa selama saldo cukup</blockquote>\n"
+               f"🙏 <i>Silakan coba top up lagi nanti ya.</i>")
+
+@r.message(Command("topup"))
+async def cmd_topup(m: Message):
+    """Admin: /topup off = tutup top up (maintenance), /topup on = buka lagi, /topup = lihat status."""
+    if m.from_user.id not in ADMINS: return
+    arg = (m.text or "").split()[1:2]
+    if arg and arg[0].lower() in ("on", "off"):
+        await set_topup_open(arg[0].lower() == "on")
+    on = await topup_open()
+    await m.answer(f"💳 <b>Top up: {'🟢 TERBUKA' if on else '🔴 DITUTUP (maintenance)'}</b>\n{LINE}\n"
+                   f"/topup off — tutup top up\n/topup on — buka lagi\n\n"
+                   f"<i>Invoice yang sudah terlanjur dibuat tetap akan masuk otomatis kalau dibayar.</i>")
+
 @r.callback_query(F.data == "dep")
 async def dep(cb: CallbackQuery):
     await cb.answer()
+    if not await topup_open():
+        return await show(cb, MAINT_TOPUP, kb([[b("🏠 Menu Utama", "home")]]))
     amts = [10000, 20000, 50000, 100000]
     rows = [[b("💳 " + rp(a), f"dp:{a}") for a in amts[:2]], [b("💳 " + rp(a), f"dp:{a}") for a in amts[2:]],
             [b("✏️ Nominal Lain", "dpx")], [b("🏠 Menu Utama", "home")]]
@@ -1129,6 +1156,9 @@ async def dep(cb: CallbackQuery):
 @r.callback_query(F.data == "dpx")
 async def dpx(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await topup_open():
+        await state.clear()
+        return await show(cb, MAINT_TOPUP, kb([[b("🏠 Menu Utama", "home")]]))
     await state.set_state(Dep.amount)
     await show(cb, f"✏️ Ketik nominal deposit (angka saja, min. {rp(MIN_DEP)}):")
 
@@ -1164,6 +1194,8 @@ async def dp(cb: CallbackQuery):
 async def ask_deposit(target, uid, amount):
     """Tampilkan rincian top up (biaya admin Kasera ditanggung pembeli) lalu minta konfirmasi."""
     msg = target.message if isinstance(target, CallbackQuery) else target
+    if not await topup_open():
+        return await msg.answer(MAINT_TOPUP, reply_markup=kb([[b("🏠 Menu Utama", "hm")]]))
     if amount < MIN_DEP:
         return await msg.answer(f"⚠️ Minimal top up adalah {rp(MIN_DEP)}.")
     if not KASERA_KEY:  # mode manual: tanpa biaya admin Kasera
@@ -1181,6 +1213,8 @@ async def ask_deposit(target, uid, amount):
 @r.callback_query(F.data.startswith("dpc:"))
 async def dp_confirm(cb: CallbackQuery):
     await cb.answer()
+    if not await topup_open():
+        return await cb.message.answer(MAINT_TOPUP, reply_markup=kb([[b("🏠 Menu Utama", "hm")]]))
     amount = int(cb.data.split(":")[1])
     if amount < MIN_DEP:
         return
@@ -1350,7 +1384,54 @@ async def admin(m: Message):
     o = await one("SELECT COUNT(*) c, COALESCE(SUM(price),0) s FROM orders WHERE refunded=0")
     await m.answer(f"🛠 <b>Admin</b>\n{LINE}\n👥 User: {u}\n🧾 Order sukses/aktif: {o['c']}\n💵 Omzet: {rp(o['s'])}\n"
                    f"🏦 Saldo SMSCode: {rp(d['balance']) if d else 'n/a'}\n\n"
-                   f"/addsaldo &lt;user_id&gt; &lt;nominal&gt;\n/wdlist (penarikan referral menunggu)\n/setref &lt;id_pengajak&gt; &lt;id_user...&gt;\n/refstats\n/broadcast &lt;pesan&gt; (manual ke user)\n/trafik (laporan trafik, HANYA ke channel)\n/autobroadcast (promosi harga termurah, HANYA ke user)\n/testchannel\n/backup (kirim file database ke chat ini)\n/restore (kirim file .db dengan caption /restore)")
+                   f"/addsaldo &lt;user_id&gt; &lt;nominal&gt;\n/topup on|off (buka/tutup top up)\n/saldoall (rekap saldo semua user + CSV; tambah kata <code>channel</code> untuk kirim ke channel WD)\n/wdlist (penarikan referral menunggu)\n/setref &lt;id_pengajak&gt; &lt;id_user...&gt;\n/refstats\n/broadcast &lt;pesan&gt; (manual ke user)\n/trafik (laporan trafik, HANYA ke channel)\n/autobroadcast (promosi harga termurah, HANYA ke user)\n/testchannel\n/backup (kirim file database ke chat ini)\n/restore (kirim file .db dengan caption /restore)")
+
+@r.message(Command("saldoall"))
+async def saldoall(m: Message, bot: Bot):
+    """Admin: rekap saldo SEMUA user (ringkasan + file CSV per user). Tambah kata 'channel' untuk sekaligus kirim ke channel WD."""
+    if m.from_user.id not in ADMINS: return
+    to_channel = "channel" in m.text.lower().split()[1:]
+    rows = await fetch("SELECT id, name, balance, COALESCE(ref_balance,0) ref FROM users "
+                       "WHERE balance<>0 OR COALESCE(ref_balance,0)<>0 ORDER BY balance DESC, ref DESC")
+    tot = await one("SELECT COUNT(*) n, COALESCE(SUM(balance),0) a, COALESCE(SUM(COALESCE(ref_balance,0)),0) b FROM users")
+    wd = await one("SELECT COUNT(*) n, COALESCE(SUM(amount),0) c FROM withdrawals WHERE status='PENDING'")
+    act = await one("SELECT COUNT(*) n, COALESCE(SUM(price),0) d FROM orders WHERE status='ACTIVE' AND refunded=0")
+    d, _ = await api("GET", "/balance")
+    a, b_, c, dd = tot["a"], tot["b"], wd["c"], act["d"]
+    text = (f"🧮 <b>REKAP SALDO SEMUA USER</b>\n{LINE}\n🕒 {_tgl(time.time())}\n\n"
+            f"👥 User terdaftar: <b>{tot['n']}</b> · punya saldo: <b>{len(rows)}</b>\n\n"
+            f"💵 <b>Saldo bot semua user: {rp(a)}</b>\n"
+            f"🎁 Saldo referral: {rp(b_)}\n"
+            f"⏳ Penarikan referral pending ({wd['n']}): {rp(c)}\n"
+            f"🔄 Order aktif ({act['n']}): {rp(dd)} <i>(dana tertahan, kembali ke saldo bila batal/expired)</i>\n\n"
+            f"📌 Saldo bot + order aktif: <b>{rp(a + dd)}</b>\n"
+            f"📌 Total semua (semua baris di atas): <b>{rp(a + b_ + c + dd)}</b>\n"
+            f"🏦 Saldo SMSCode sekarang: {rp(d['balance']) if d else 'n/a'}")
+
+    def safe(x):  # cegah formula injection saat CSV dibuka di Excel
+        x = str(x or "")
+        return "'" + x if x[:1] in "=+-@" else x
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["user_id", "nama", "saldo_bot", "saldo_referral", "total"])
+    for x in rows:
+        w.writerow([x["id"], safe(x["name"]), x["balance"], x["ref"], x["balance"] + x["ref"]])
+    w.writerow(["TOTAL", f"{len(rows)} user", a, b_, a + b_])
+    fname = f"saldo_user_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.csv"
+    doc = lambda: BufferedInputFile(buf.getvalue().encode("utf-8-sig"), fname)
+
+    await m.answer(text)
+    await m.answer_document(doc(), caption="📎 Detail saldo per user")
+    if to_channel:
+        t = wd_chan_target()
+        if t is None:
+            return await m.answer("⚠️ Channel WD belum diset. Isi env <code>WD_CHANNEL_ID</code> (contoh -1001234567890).")
+        try:
+            await bot.send_message(t, text)
+            await bot.send_document(t, doc(), caption="📎 Detail saldo per user")
+            await m.answer("✅ Rekap juga terkirim ke channel.")
+        except Exception as e:
+            await m.answer(f"❌ Gagal kirim ke channel: {esc(str(e))}")
 
 @r.message(Command("addsaldo"))
 async def addsaldo(m: Message):
