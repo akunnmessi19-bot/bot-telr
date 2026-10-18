@@ -32,6 +32,20 @@ DB_PATH = os.getenv("DB_PATH") or (os.path.join(_vol, "store.db") if _vol else "
 AUTO_CANCEL = int(os.getenv("AUTO_CANCEL_MIN", "10")) * 60
 KASERA_KEY = os.getenv("KASERA_API_KEY", "")          # kp_test_... atau kp_live_...
 WH_SECRET = os.getenv("KASERA_WEBHOOK_SECRET", "")    # signing secret endpoint webhook
+# ---- Casaku (QRIS statis -> dinamis, deteksi bayar lewat aplikasi listener di HP) ----
+# Aktif hanya jika PAY_PROVIDER=casaku (default tetap Kasera). Semua nilai diisi lewat Variables Railway.
+CASAKU_BASE = os.getenv("CASAKU_BASE_URL", "https://api.casaku.id").strip().rstrip("/")
+CASAKU_KEY = os.getenv("CASAKU_LICENSE_KEY", "").strip()                  # dashboard casaku.id/api-keys
+CASAKU_QRIS_ID = os.getenv("CASAKU_QRIS_ID", "").strip()                  # UUID QRIS dari dashboard Casaku
+CASAKU_PACKAGES = [x.strip() for x in os.getenv("CASAKU_PACKAGE_IDS", "").split(",") if x.strip()]   # pisahkan dengan koma
+CASAKU_SECRET = os.getenv("CASAKU_WEBHOOK_SECRET", "").strip()            # opsional; kalau diisi, webhook /casaku/webhook aktif
+CASAKU_EXPIRE = int(os.getenv("CASAKU_EXPIRE_MIN") or 15)
+# Biaya operasional bot (untuk VPS dll): ditambahkan ke tagihan, saldo user tetap utuh. Nilainya acak di rentang ini dan
+# sekaligus jadi kode unik pembeda tiap invoice. Isi CASAKU_FEE_MAX=0 untuk MEMATIKAN (kode unik dari Casaku, semua jadi saldo).
+CASAKU_FEE_MIN = int(os.getenv("CASAKU_FEE_MIN") or 250)
+CASAKU_FEE_MAX = int(os.getenv("CASAKU_FEE_MAX") or 399)
+CASAKU_OWN_FEE = 0 < CASAKU_FEE_MIN <= CASAKU_FEE_MAX
+USE_CASAKU = os.getenv("PAY_PROVIDER", "kasera").strip().lower() == "casaku" and bool(CASAKU_KEY and CASAKU_QRIS_ID)
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT") or os.getenv("PORT") or 8080)   # Railway otomatis mengisi PORT
 FEE_PCT_BPS = round(float(os.getenv("KASERA_FEE_PERCENT", "0.7")) * 100)     # QRIS Kasera 0,7% (dalam basis poin)
 FEE_FIXED = int(os.getenv("KASERA_FEE_FIXED", "250"))                        # QRIS Kasera + Rp250
@@ -139,7 +153,7 @@ async def init_db():
     CREATE TABLE IF NOT EXISTS withdrawals(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER,
         method TEXT, account TEXT, holder TEXT, fee INTEGER DEFAULT 0, status TEXT DEFAULT 'PENDING', created REAL);
     """)
-    for tbl, col in [("deposits", "kasera_id TEXT"), ("orders", "sid INTEGER"), ("orders", "cid INTEGER"), ("orders", "oid INTEGER"),
+    for tbl, col in [("deposits", "kasera_id TEXT"), ("deposits", "casaku_id TEXT"), ("orders", "sid INTEGER"), ("orders", "cid INTEGER"), ("orders", "oid INTEGER"),
                      ("orders", "svc TEXT"), ("orders", "ctry TEXT"), ("orders", "code TEXT"), ("orders", "msg TEXT"),
                      ("orders", "ph INTEGER"), ("users", "ref_balance INTEGER DEFAULT 0"), ("withdrawals", "chan_msg INTEGER")]:
         try:
@@ -1171,6 +1185,8 @@ async def dep_amount(m: Message, state: FSMContext):
     await ask_deposit(m, m.from_user.id, int(txt))
 
 async def send_invoice(target, uid, amount):
+    if USE_CASAKU:
+        return await casaku_invoice(target, uid, amount)
     if KASERA_KEY:
         return await kasera_invoice(target, uid, amount)
     code = random.randint(1, 999)  # kode unik agar mudah dicocokkan admin
@@ -1198,6 +1214,17 @@ async def ask_deposit(target, uid, amount):
         return await msg.answer(MAINT_TOPUP, reply_markup=kb([[b("🏠 Menu Utama", "hm")]]))
     if amount < MIN_DEP:
         return await msg.answer(f"⚠️ Minimal top up adalah {rp(MIN_DEP)}.")
+    if USE_CASAKU:
+        if CASAKU_OWN_FEE:
+            rows_txt = (f"💰 Saldo masuk  <b>{rp(amount)}</b>\n🧾 Biaya operasional  <b>{rp(CASAKU_FEE_MIN)}–{rp(CASAKU_FEE_MAX)}</b>\n"
+                        f"📲 Metode  <b>QRIS</b>")
+            saldo_txt = f"Saldo yang masuk utuh {rp(amount)}. Total bayar pasti tampil di invoice."
+        else:
+            rows_txt = f"💰 Nominal top up  <b>{rp(amount)}</b>\n🔢 Kode unik  <b>+Rp1–999</b> (otomatis)\n📲 Metode  <b>QRIS</b>"
+            saldo_txt = "Seluruh total bayar (nominal + kode unik) masuk jadi saldo. Total bayar pasti tampil di invoice."
+        return await msg.answer(
+            f"📝 <b>KONFIRMASI TOP UP SALDO</b>\n{LINE}\n<blockquote>{rows_txt}</blockquote>\n<i>{saldo_txt}</i>",
+            reply_markup=kb([[b(f"✅ Lanjut Bayar", f"dpc:{amount}")], [b("‹ Ganti Nominal", "dep"), b("🏠 Menu", "hm")]]))
     if not KASERA_KEY:  # mode manual: tanpa biaya admin Kasera
         return await send_invoice(target, uid, amount)
     q = hitung_tagihan_kasera(amount, "QRIS")
@@ -1375,6 +1402,209 @@ async def poll_deposits(bot: Bot):
         await asyncio.sleep(1.1)
 
 
+# ---------- Casaku (QRIS statis -> dinamis; pembayaran dideteksi aplikasi listener di HP) ----------
+async def casaku(method, path, **kw):
+    """Panggil API Casaku. Return (json, err); err = {'status', 'message'} atau None."""
+    try:
+        async with http.request(method, CASAKU_BASE + path, timeout=aiohttp.ClientTimeout(total=15),
+                                headers={"x-license-key": CASAKU_KEY, "Content-Type": "application/json"}, **kw) as resp:
+            status = resp.status
+            try:
+                j = await resp.json(content_type=None)
+            except Exception:
+                j = {}
+    except Exception as e:
+        log.warning("Casaku %s %s gagal (exception): %s", method, path, e)
+        return None, {"status": 0, "message": f"network: {e}"}
+    j = j if isinstance(j, dict) else {}
+    if status < 300:
+        return j, None
+    log.warning("Casaku %s %s gagal (HTTP %s): %s", method, path, status, j)
+    return None, {"status": status, "message": str(j.get("message") or f"HTTP {status}")}
+
+_casaku_alert_at = {}
+async def casaku_alert(bot, key, text, every=900):
+    """Kirim peringatan ke admin, maksimal sekali per `every` detik untuk tiap jenis masalah."""
+    if time.time() - _casaku_alert_at.get(key, 0) < every: return
+    _casaku_alert_at[key] = time.time()
+    for a in ADMINS:
+        try:
+            await bot.send_message(a, text)
+        except Exception:
+            pass
+
+async def casaku_invoice(target, uid, amount):
+    msg = target.message if isinstance(target, CallbackQuery) else target
+    send_amount = amount
+    if CASAKU_OWN_FEE:   # pilih biaya acak yang belum dipakai invoice pending lain, supaya total tiap invoice unik
+        used = {r_["total"] for r_ in await fetch("SELECT total FROM deposits WHERE status='PENDING' AND created>?",
+                                                  (time.time() - (CASAKU_EXPIRE + 10) * 60,))}
+        free = [f for f in range(CASAKU_FEE_MIN, CASAKU_FEE_MAX + 1) if amount + f not in used]
+        if not free:
+            return await msg.answer("⏳ Sedang banyak top up berjalan. Coba lagi beberapa menit lagi.")
+        send_amount = amount + random.choice(free)
+    cur = await db.execute("INSERT INTO deposits(user_id,amount,total,created) VALUES(?,?,?,?)", (uid, amount, send_amount, time.time()))
+    await db.commit()
+    did = cur.lastrowid
+    j, err = await casaku("POST", "/api/generate/qris", json={
+        "id": CASAKU_QRIS_ID, "amount": send_amount, "useUniqueCode": not CASAKU_OWN_FEE,
+        "packageIds": CASAKU_PACKAGES, "expiredInMinutes": CASAKU_EXPIRE})
+    d = (j or {}).get("data") or {}
+    if err or not d.get("transactionId"):
+        await run("UPDATE deposits SET status='FAILED' WHERE id=?", (did,))
+        code, detail = (err["status"], err["message"]) if err else (0, "respons tanpa transactionId")
+        if code == 403:
+            await casaku_alert(msg.bot, "offline", f"⚠️ <b>Casaku: aplikasi listener OFFLINE</b>\nTop up ditolak. Buka aplikasi Casaku di HP.\n<code>{esc(detail)}</code>")
+            note = "😕 Pembayaran otomatis sedang gangguan. Coba lagi beberapa menit lagi."
+        elif code == 401:
+            await casaku_alert(msg.bot, "license", f"⚠️ <b>Casaku: License Key tidak valid</b>\n<code>{esc(detail)}</code>")
+            note = "😕 Pembayaran sedang gangguan. Admin sudah diberi tahu."
+        elif code == 429:
+            note = "⏳ Terlalu banyak permintaan. Coba lagi sebentar lagi."
+        else:
+            await casaku_alert(msg.bot, f"gen{code}", f"⚠️ Gagal membuat invoice Casaku (deposit #{did}, HTTP {code}):\n<code>{esc(detail)}</code>", 300)
+            note = "😕 Gagal membuat invoice, coba lagi sebentar lagi."
+        return await msg.answer(note)
+    total = int(d.get("totalAmount") or send_amount)          # angka dari Casaku jadi acuan
+    saldo = amount if CASAKU_OWN_FEE else total               # mode biaya sendiri: saldo = nominal; mode lama: seluruh total
+    if CASAKU_OWN_FEE and total - amount > CASAKU_FEE_MAX:
+        log.warning("Deposit #%s: Casaku menambah angka di luar rencana (kirim %s, total %s)", did, send_amount, total)
+    await run("UPDATE deposits SET casaku_id=?, total=?, amount=? WHERE id=?", (str(d["transactionId"]), total, saldo, did))
+    biaya = total - saldo
+    label = "Biaya operasional" if CASAKU_OWN_FEE else "Kode unik (ikut jadi saldo)"
+    text = (f"🧾 <b>INVOICE TOP UP #{did}</b>\n{LINE}\n"
+            f"<blockquote>💰 Saldo masuk  <b>{rp(saldo)}</b>\n🧾 {label}  <b>{rp(biaya)}</b>\n"
+            f"💳 Total bayar  <b>{rp(total)}</b>\n📲 Metode  <b>QRIS</b>\n⏱ Berlaku  <b>{CASAKU_EXPIRE} menit</b></blockquote>\n"
+            f"⚠️ Bayar <b>TEPAT {rp(total)}</b> supaya terdeteksi otomatis ✅")
+    rows = []
+    if d.get("payment_url"):
+        rows.append([InlineKeyboardButton(text="🌐 Buka Halaman Bayar", url=d["payment_url"])])
+    rows += [[b("🔄 Cek Pembayaran", f"ckd:{did}")], [b("🏠 Menu", "hm")]]
+    if d.get("qr_string"):
+        await msg.answer_photo(BufferedInputFile(qr_png(d["qr_string"]), "qris.png"), caption=text, reply_markup=kb(rows))
+    else:
+        await msg.answer(text, reply_markup=kb(rows))
+
+async def casaku_check(bot, d):
+    """Cek status transaksi ke Casaku. Return: paid | pending | expired | mismatch | None (gagal cek)."""
+    j, err = await casaku("POST", "/api/generate/check-status", json={"transactionId": d["casaku_id"]})
+    if err:
+        return None
+    data = (j or {}).get("data") or {}
+    st = data.get("status")
+    if st == "paid":
+        await settle(bot, d["id"], data.get("amount"))
+        now = await one("SELECT status FROM deposits WHERE id=?", (d["id"],))
+        if now and now["status"] == "OK":
+            return "paid"
+        await casaku_alert(bot, f"mm{d['id']}", f"⚠️ Casaku melaporkan LUNAS tapi nominal tidak cocok (deposit #{d['id']}, "
+                                                f"bayar {rp(data.get('amount') or 0)}, seharusnya {rp(d['total'])}). Saldo TIDAK ditambah; periksa manual.", 3600)
+        return "mismatch"
+    if st in ("expired", "cancel"):
+        await run("UPDATE deposits SET status='EXPIRED' WHERE id=? AND status='PENDING'", (d["id"],))
+        return "expired"
+    return "pending"
+
+_ck_last = {}
+@r.callback_query(F.data.startswith("ckd:"))
+async def casaku_check_cb(cb: CallbackQuery, bot: Bot):
+    d = await one("SELECT * FROM deposits WHERE id=? AND user_id=?", (int(cb.data.split(":")[1]), cb.from_user.id))
+    if not d or not d["casaku_id"]:
+        return await cb.answer("Top up tidak ditemukan.", show_alert=True)
+    if d["status"] == "OK":
+        return await cb.answer("✅ Pembayaran sudah diterima, saldo sudah masuk.", show_alert=True)
+    if time.time() - _ck_last.get(d["id"], 0) < 5:
+        return await cb.answer("Tunggu beberapa detik lalu coba lagi.")
+    _ck_last[d["id"]] = time.time()
+    res = await casaku_check(bot, d)
+    await cb.answer({"paid": "✅ Pembayaran diterima, saldo sudah ditambahkan!",
+                     "pending": "⏳ Belum terdeteksi. Pastikan nominal TEPAT, lalu tunggu beberapa detik.",
+                     "expired": "⌛ Invoice sudah kedaluwarsa. Silakan buat top up baru.",
+                     "mismatch": "⚠️ Ada ketidakcocokan nominal. Admin akan memeriksa."}.get(res, "Gagal mengecek, coba lagi sebentar."),
+                    show_alert=True)
+
+_casaku_last = 0.0
+_casaku_dev_at = 0.0
+_casaku_dev_ok = True
+_casaku_dep_at = {}
+async def casaku_poll(bot: Bot):
+    """Cek invoice pending (jaga-jaga webhook terlewat) + pantau aplikasi listener di HP."""
+    global _casaku_last, _casaku_dev_at, _casaku_dev_ok
+    if not USE_CASAKU or time.time() - _casaku_last < 5: return
+    _casaku_last = now = time.time()
+    horizon = now - (CASAKU_EXPIRE + 10) * 60
+    for d in await fetch("SELECT * FROM deposits WHERE status='PENDING' AND casaku_id IS NOT NULL AND created>?", (horizon,)):
+        every = 5 if now - d["created"] < 90 else 15          # makin lama makin jarang supaya aman dari rate limit
+        if now - _casaku_dep_at.get(d["id"], 0) < every: continue
+        _casaku_dep_at[d["id"]] = now
+        await casaku_check(bot, d)
+        await asyncio.sleep(0.5)
+    await run("UPDATE deposits SET status='EXPIRED' WHERE status='PENDING' AND casaku_id IS NOT NULL AND created<=?", (horizon,))
+    if now - _casaku_dev_at > 300:
+        _casaku_dev_at = now
+        j, err = await casaku("GET", "/api/device/check")
+        if not err:
+            dd = (j or {}).get("data") or {}
+            online = bool(dd.get("anyOnline"))
+            if not online:
+                await casaku_alert(bot, "listener", "⚠️ <b>Casaku: aplikasi listener OFFLINE.</b>\nPembayaran QRIS tidak terdeteksi sampai "
+                                                    "aplikasi Casaku di HP aktif lagi. Cek koneksi internet, baterai, dan izin notifikasi.")
+            elif not _casaku_dev_ok:
+                await casaku_alert(bot, "listener_ok", "✅ Casaku: aplikasi listener kembali ONLINE.", 0)
+            _casaku_dev_ok = online
+
+def casaku_sig_ok(secret, body, sig):
+    """HMAC-SHA256 dari RAW body, dibandingkan constant-time (terima format hex maupun base64)."""
+    sig = (sig or "").strip()
+    if sig.lower().startswith("sha256="): sig = sig[7:]
+    mac = hmac.new(secret.encode(), body, hashlib.sha256).digest()
+    return any(hmac.compare_digest(c, sig) for c in (mac.hex(), base64.b64encode(mac).decode()))
+
+_bg_tasks = set()
+async def casaku_confirm(bot, tx_id):
+    d = await one("SELECT * FROM deposits WHERE casaku_id=?", (tx_id,))
+    if d and d["status"] != "OK":
+        await casaku_check(bot, d)       # selalu konfirmasi ulang ke API, tidak percaya isi webhook begitu saja
+
+async def casaku_webhook(request: web.Request):
+    body = await request.read()
+    if not CASAKU_SECRET or not casaku_sig_ok(CASAKU_SECRET, body, request.headers.get("X-Casaku-Signature")):
+        return web.Response(status=401, text="bad signature")
+    try:
+        ev = json.loads(body)
+    except ValueError:
+        return web.Response(status=400, text="bad json")
+    if isinstance(ev, dict) and ev.get("status") == "paid" and ev.get("transactionId"):
+        t = asyncio.create_task(casaku_confirm(request.app["bot"], str(ev["transactionId"])))
+        _bg_tasks.add(t)
+        t.add_done_callback(_bg_tasks.discard)
+    return web.Response(text="ok")      # balas cepat (batas 10 detik); pemrosesan di latar belakang
+
+@r.message(Command("casaku"))
+async def cmd_casaku(m: Message):
+    """Admin: status Casaku (provider aktif, akun, aplikasi listener di HP)."""
+    if m.from_user.id not in ADMINS: return
+    if not CASAKU_KEY:
+        return await m.answer("⚠️ CASAKU_LICENSE_KEY belum diisi.")
+    pj, e1 = await casaku("GET", "/api/profile")
+    dj, e2 = await casaku("GET", "/api/device/check")
+    t = f"💳 <b>Casaku</b>\n{LINE}\nProvider aktif: <b>{'Casaku' if USE_CASAKU else 'Kasera (Casaku belum dinyalakan)'}</b>\n"
+    if e1:
+        t += f"❌ Profil: <code>{esc(e1['message'])}</code>\n"
+    else:
+        p = (pj or {}).get("data") or {}
+        t += f"🏪 Toko: {esc(p.get('storeName') or p.get('name') or '-')}\n⭐ VIP: {'ya' if p.get('vipstatus') else 'tidak'} · berakhir {esc(p.get('vipexpires') or '-')}\n"
+    if e2:
+        t += f"❌ Listener: <code>{esc(e2['message'])}</code>\n"
+    else:
+        dd = (dj or {}).get("data") or {}
+        t += f"📱 Listener online: <b>{dd.get('onlineDevices', 0)}/{dd.get('totalDevices', 0)}</b>\n"
+        for dv in (dd.get("devices") or [])[:5]:
+            t += f"• {'🟢' if dv.get('isOnline') else '🔴'} {esc(dv.get('deviceId') or '-')} · 🔋 {dv.get('batteryLevel', '?')}%{' ⚡' if dv.get('isCharging') else ''}\n"
+    n = (await one("SELECT COUNT(*) c FROM deposits WHERE status='PENDING' AND casaku_id IS NOT NULL"))["c"]
+    await m.answer(t + f"⏳ Invoice Casaku pending: {n}\n🔗 Webhook: {'aktif' if (USE_CASAKU and CASAKU_SECRET) else 'nonaktif (pakai polling)'}")
+
+
 # ---------- admin ----------
 @r.message(Command("admin"))
 async def admin(m: Message):
@@ -1384,7 +1614,7 @@ async def admin(m: Message):
     o = await one("SELECT COUNT(*) c, COALESCE(SUM(price),0) s FROM orders WHERE refunded=0")
     await m.answer(f"🛠 <b>Admin</b>\n{LINE}\n👥 User: {u}\n🧾 Order sukses/aktif: {o['c']}\n💵 Omzet: {rp(o['s'])}\n"
                    f"🏦 Saldo SMSCode: {rp(d['balance']) if d else 'n/a'}\n\n"
-                   f"/addsaldo &lt;user_id&gt; &lt;nominal&gt;\n/topup on|off (buka/tutup top up)\n/saldoall (rekap saldo semua user + CSV; tambah kata <code>channel</code> untuk kirim ke channel WD)\n/wdlist (penarikan referral menunggu)\n/setref &lt;id_pengajak&gt; &lt;id_user...&gt;\n/refstats\n/broadcast &lt;pesan&gt; (manual ke user)\n/trafik (laporan trafik, HANYA ke channel)\n/autobroadcast (promosi harga termurah, HANYA ke user)\n/testchannel\n/backup (kirim file database ke chat ini)\n/restore (kirim file .db dengan caption /restore)")
+                   f"/addsaldo &lt;user_id&gt; &lt;nominal&gt;\n/topup on|off (buka/tutup top up)\n/casaku (status pembayaran Casaku)\n/saldoall (rekap saldo semua user + CSV; tambah kata <code>channel</code> untuk kirim ke channel WD)\n/wdlist (penarikan referral menunggu)\n/setref &lt;id_pengajak&gt; &lt;id_user...&gt;\n/refstats\n/broadcast &lt;pesan&gt; (manual ke user)\n/trafik (laporan trafik, HANYA ke channel)\n/autobroadcast (promosi harga termurah, HANYA ke user)\n/testchannel\n/backup (kirim file database ke chat ini)\n/restore (kirim file .db dengan caption /restore)")
 
 @r.message(Command("saldoall"))
 async def saldoall(m: Message, bot: Bot):
@@ -1567,6 +1797,7 @@ async def poller(bot: Bot):
         try:
             await poll(bot)
             await poll_deposits(bot)
+            await casaku_poll(bot)
         except Exception:
             log.exception("poll error")
         await asyncio.sleep(4)
@@ -2159,14 +2390,23 @@ async def main():
     dp_ = Dispatcher(storage=MemoryStorage())
     dp_.include_router(r)
     runner = None
-    if KASERA_KEY and WH_SECRET:
+    if os.getenv("PAY_PROVIDER", "").strip().lower() == "casaku" and not USE_CASAKU:
+        log.warning("PAY_PROVIDER=casaku tetapi CASAKU_LICENSE_KEY / CASAKU_QRIS_ID belum diisi; memakai Kasera.")
+    if USE_CASAKU and not CASAKU_PACKAGES:
+        log.warning("CASAKU_PACKAGE_IDS kosong; Casaku mungkin menolak pembuatan invoice.")
+    wh_kasera = bool(KASERA_KEY and WH_SECRET)
+    wh_casaku = bool(USE_CASAKU and CASAKU_SECRET)
+    if wh_kasera or wh_casaku:
         app = web.Application()
         app["bot"] = bot
-        app.router.add_post("/kasera/webhook", kasera_webhook)
+        if wh_kasera:
+            app.router.add_post("/kasera/webhook", kasera_webhook)
+        if wh_casaku:
+            app.router.add_post("/casaku/webhook", casaku_webhook)
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT).start()
-        log.info("Webhook Kasera aktif di port %s", WEBHOOK_PORT)
+        log.info("Webhook aktif di port %s (kasera=%s, casaku=%s)", WEBHOOK_PORT, wh_kasera, wh_casaku)
     task = asyncio.create_task(poller(bot))
     ttask = asyncio.create_task(run_schedule("trafik-channel", TRAFFIC_SLOTS, traffic_job, bot))
     ptask = asyncio.create_task(run_schedule("promo-user", PROMO_SLOTS, promo_job, bot))
