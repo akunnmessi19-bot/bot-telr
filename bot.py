@@ -40,6 +40,7 @@ CASAKU_QRIS_ID = os.getenv("CASAKU_QRIS_ID", "").strip()                  # UUID
 CASAKU_PACKAGES = [x.strip() for x in os.getenv("CASAKU_PACKAGE_IDS", "").split(",") if x.strip()]   # pisahkan dengan koma
 CASAKU_SECRET = os.getenv("CASAKU_WEBHOOK_SECRET", "").strip()            # opsional; kalau diisi, webhook /casaku/webhook aktif
 CASAKU_EXPIRE = int(os.getenv("CASAKU_EXPIRE_MIN") or 15)
+CASAKU_PAGE_BTN = os.getenv("CASAKU_PAGE_BUTTON", "0") == "1"             # 1 = tampilkan tombol "Buka Halaman Bayar" (butuh Payment Page Casaku aktif)
 # Biaya operasional bot (untuk VPS dll): ditambahkan ke tagihan, saldo user tetap utuh. Nilainya acak di rentang ini dan
 # sekaligus jadi kode unik pembeda tiap invoice. Isi CASAKU_FEE_MAX=0 untuk MEMATIKAN (kode unik dari Casaku, semua jadi saldo).
 CASAKU_FEE_MIN = int(os.getenv("CASAKU_FEE_MIN") or 250)
@@ -1477,7 +1478,7 @@ async def casaku_invoice(target, uid, amount):
             f"💳 Total bayar  <b>{rp(total)}</b>\n📲 Metode  <b>QRIS</b>\n⏱ Berlaku  <b>{CASAKU_EXPIRE} menit</b></blockquote>\n"
             f"⚠️ Bayar <b>TEPAT {rp(total)}</b> supaya terdeteksi otomatis ✅")
     rows = []
-    if d.get("payment_url"):
+    if CASAKU_PAGE_BTN and d.get("payment_url"):
         rows.append([InlineKeyboardButton(text="🌐 Buka Halaman Bayar", url=d["payment_url"])])
     rows += [[b("🔄 Cek Pembayaran", f"ckd:{did}")], [b("🏠 Menu", "hm")]]
     if d.get("qr_string"):
