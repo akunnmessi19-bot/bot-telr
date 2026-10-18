@@ -37,7 +37,9 @@ WH_SECRET = os.getenv("KASERA_WEBHOOK_SECRET", "")    # signing secret endpoint 
 CASAKU_BASE = os.getenv("CASAKU_BASE_URL", "https://api.casaku.id").strip().rstrip("/")
 CASAKU_KEY = os.getenv("CASAKU_LICENSE_KEY", "").strip()                  # dashboard casaku.id/api-keys
 CASAKU_QRIS_ID = os.getenv("CASAKU_QRIS_ID", "").strip()                  # UUID QRIS dari dashboard Casaku
-CASAKU_PACKAGES = [x.strip() for x in os.getenv("CASAKU_PACKAGE_IDS", "").split(",") if x.strip()]   # pisahkan dengan koma
+# Package ID = nama paket aplikasi yang notifikasinya dibaca Casaku (lihat Casaku > Setup > Filter Package). Pisahkan dengan koma.
+# Contoh: id.dana (DANA Bisnis), com.gojek.gopaymerchant (GoPay Merchant), com.bca.msb (BCA Merchant). Kalau env kosong -> id.dana.
+CASAKU_PACKAGES = [x.strip() for x in (os.getenv("CASAKU_PACKAGE_IDS") or "id.dana").split(",") if x.strip()]
 CASAKU_SECRET = os.getenv("CASAKU_WEBHOOK_SECRET", "").strip()            # opsional; kalau diisi, webhook /casaku/webhook aktif
 CASAKU_EXPIRE = int(os.getenv("CASAKU_EXPIRE_MIN") or 15)
 CASAKU_PAGE_BTN = os.getenv("CASAKU_PAGE_BUTTON", "0") == "1"             # 1 = tampilkan tombol "Buka Halaman Bayar" (butuh Payment Page Casaku aktif)
@@ -1447,6 +1449,7 @@ async def casaku_invoice(target, uid, amount):
     cur = await db.execute("INSERT INTO deposits(user_id,amount,total,created) VALUES(?,?,?,?)", (uid, amount, send_amount, time.time()))
     await db.commit()
     did = cur.lastrowid
+    log.info("Casaku invoice deposit #%s: amount=%s packageIds=%s", did, send_amount, CASAKU_PACKAGES)
     j, err = await casaku("POST", "/api/generate/qris", json={
         "id": CASAKU_QRIS_ID, "amount": send_amount, "useUniqueCode": not CASAKU_OWN_FEE,
         "packageIds": CASAKU_PACKAGES, "expiredInMinutes": CASAKU_EXPIRE})
@@ -1603,6 +1606,9 @@ async def cmd_casaku(m: Message):
         for dv in (dd.get("devices") or [])[:5]:
             t += f"• {'🟢' if dv.get('isOnline') else '🔴'} {esc(dv.get('deviceId') or '-')} · 🔋 {dv.get('batteryLevel', '?')}%{' ⚡' if dv.get('isCharging') else ''}\n"
     n = (await one("SELECT COUNT(*) c FROM deposits WHERE status='PENDING' AND casaku_id IS NOT NULL"))["c"]
+    t += (f"📦 Package ID dipakai: <code>{esc(', '.join(CASAKU_PACKAGES))}</code>"
+          f"{'' if os.getenv('CASAKU_PACKAGE_IDS') else ' (default)'}\n"
+          f"<i>Harus sama dengan aplikasi yang menerima notifikasi bayar di HP (Casaku &gt; Setup &gt; Filter Package).</i>\n")
     await m.answer(t + f"⏳ Invoice Casaku pending: {n}\n🔗 Webhook: {'aktif' if (USE_CASAKU and CASAKU_SECRET) else 'nonaktif (pakai polling)'}")
 
 
@@ -2393,8 +2399,9 @@ async def main():
     runner = None
     if os.getenv("PAY_PROVIDER", "").strip().lower() == "casaku" and not USE_CASAKU:
         log.warning("PAY_PROVIDER=casaku tetapi CASAKU_LICENSE_KEY / CASAKU_QRIS_ID belum diisi; memakai Kasera.")
-    if USE_CASAKU and not CASAKU_PACKAGES:
-        log.warning("CASAKU_PACKAGE_IDS kosong; Casaku mungkin menolak pembuatan invoice.")
+    if USE_CASAKU:
+        log.info("Casaku aktif. Package ID notifikasi: %s%s", ", ".join(CASAKU_PACKAGES),
+                 "" if os.getenv("CASAKU_PACKAGE_IDS") else " (default; isi CASAKU_PACKAGE_IDS kalau berbeda)")
     wh_kasera = bool(KASERA_KEY and WH_SECRET)
     wh_casaku = bool(USE_CASAKU and CASAKU_SECRET)
     if wh_kasera or wh_casaku:
