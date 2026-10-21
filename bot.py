@@ -155,6 +155,8 @@ async def init_db():
         amount INTEGER, created REAL);
     CREATE TABLE IF NOT EXISTS withdrawals(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER,
         method TEXT, account TEXT, holder TEXT, fee INTEGER DEFAULT 0, status TEXT DEFAULT 'PENDING', created REAL);
+    CREATE TABLE IF NOT EXISTS jimel_stock(id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT, password TEXT,
+        status TEXT DEFAULT 'READY', buyer INTEGER, price INTEGER, added REAL, sold REAL);
     """)
     for tbl, col in [("deposits", "kasera_id TEXT"), ("deposits", "casaku_id TEXT"), ("orders", "sid INTEGER"), ("orders", "cid INTEGER"), ("orders", "oid INTEGER"),
                      ("orders", "svc TEXT"), ("orders", "ctry TEXT"), ("orders", "code TEXT"), ("orders", "msg TEXT"),
@@ -290,6 +292,7 @@ def banner():
 
 def menu_kb():
     rows = [[b("📱 Beli Nomor Virtual", "sv:0")],
+            [b("📧 Beli Akun Jimel", "jm")],
             [b("💳 Top Up Saldo", "dep"), b("👤 Akun Saya", "me")],
             [b("📜 Riwayat", "hist"), b("🛟 Bantuan", "help")],
             [b("🎁 Referral", "ref")]]
@@ -541,7 +544,8 @@ def _tgl(ts):
     return datetime.fromtimestamp(ts or 0, timezone(timedelta(hours=7))).strftime("%d/%m/%y %H:%M")
 
 def hist_kb(active):
-    return kb([[b("• 🛒 Pesanan", "hist"), b("💳 Riwayat Top Up", "histd")],
+    return kb([[b("🛒 Nokos", "hist"), b("📧 Akun Jimel", "histj")],
+               [b("💳 Riwayat Top Up", "histd")],
                [b("🏠 Menu Utama", "home")]])
 
 async def show_any(cb: CallbackQuery, text, markup=None):
@@ -576,6 +580,19 @@ async def hist(cb: CallbackQuery):
                    f"<blockquote>📊 Total  <b>{st['n'] or 0}</b>   ✅ <b>{st['ok'] or 0}</b>   ❌ <b>{st['bad'] or 0}</b>\n"
                    f"💸 Total belanja  <b>{rp(st['spent'] or 0)}</b></blockquote>\n"
                    f"<blockquote expandable>{body}</blockquote>\n<i>Menampilkan 8 pesanan terakhir.</i>", hist_kb("o"))
+
+@r.callback_query(F.data == "histj")
+async def hist_jimel(cb: CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    rows = await fetch("SELECT * FROM jimel_stock WHERE buyer=? ORDER BY sold DESC LIMIT 8", (uid,))
+    st = await one("SELECT COUNT(*) n, COALESCE(SUM(price),0) s FROM jimel_stock WHERE buyer=?", (uid,))
+    items = [f"✅ <b>#{o['id']}</b> · {rp(o['price'] or 0)}\n   👤 <code>{esc(o['email'])}</code>\n"
+             f"   🔑 <code>{esc(o['password'])}</code>\n   🕒 {_tgl(o['sold'])}" for o in rows]
+    body = "\n\n".join(items) or "<i>Belum ada pembelian akun.</i>"
+    await show_any(cb, f"📧 <b>RIWAYAT AKUN JIMEL</b>\n{LINE}\n"
+                   f"<blockquote>📊 Total  <b>{st['n'] or 0}</b> akun\n💸 Total belanja  <b>{rp(st['s'])}</b></blockquote>\n"
+                   f"<blockquote expandable>{body}</blockquote>\n<i>Menampilkan 8 pembelian terakhir.</i>", hist_kb("j"))
 
 @r.callback_query(F.data == "histd")
 async def hist_dep(cb: CallbackQuery):
@@ -1119,7 +1136,7 @@ async def resend(cb: CallbackQuery):
     d, err = await api("POST", "/orders/resend", json={"id": o["id"]})
     await cb.answer("📨 Permintaan SMS baru dikirim." if d and d.get("resent") else "Layanan ini tidak mendukung kirim ulang.", show_alert=True)
 
-@r.callback_query(F.data.startswith("cp:"))
+@r.callback_query(F.data.regexp(r"^cp:\d+:[no]$"))
 async def copy_fallback(cb: CallbackQuery):
     _, oid, kind = cb.data.split(":")
     o = await own_order(cb, oid)
@@ -1129,6 +1146,210 @@ async def copy_fallback(cb: CallbackQuery):
 @r.callback_query(F.data.regexp(r"^(c|s|p|q|ok):"))
 async def old_menu(cb: CallbackQuery):
     await cb.answer("Menu sudah diperbarui. Ketik /start untuk membuka menu terbaru.", show_alert=True)
+
+
+# ---------- akun jimel (beli akun) ----------
+JIMEL_NAME = os.getenv("JIMEL_NAME", "Akun Jimel")
+JIMEL_PRICE_DEFAULT = int(os.getenv("JIMEL_PRICE") or 5000)   # harga awal; bisa diubah kapan saja lewat /setharga
+
+
+class Restock(StatesGroup):
+    password = State()   # mode password sama: tunggu password
+    akun = State()       # tunggu daftar akun
+
+
+async def jimel_price():
+    row = await one("SELECT value FROM settings WHERE key='jimel_price'")
+    try:
+        return int(row["value"]) if row else JIMEL_PRICE_DEFAULT
+    except (TypeError, ValueError):
+        return JIMEL_PRICE_DEFAULT
+
+async def set_jimel_price(n):
+    await run("INSERT OR REPLACE INTO settings(key,value) VALUES('jimel_price',?)", (str(int(n)),))
+
+JIMEL_MAX_PER_USER = 3   # maksimal akun yang boleh dibeli per ID Telegram
+_jimel_lock = asyncio.Lock()
+
+async def jimel_bought(uid):
+    return (await one("SELECT COUNT(*) c FROM jimel_stock WHERE buyer=? AND status='SOLD'", (uid,)))["c"]
+
+async def jimel_stock():
+    return (await one("SELECT COUNT(*) c FROM jimel_stock WHERE status='READY'"))["c"]
+
+
+def jimel_card(o):
+    jam = datetime.fromtimestamp(o["sold"], timezone(timedelta(hours=7))).strftime("%d/%m/%Y · %H:%M WIB")
+    return (f"📧 <b>DETAIL {esc(JIMEL_NAME.upper())} #{o['id']}</b>\n{LINE}\n"
+            f"<blockquote>👤 Username: <code>{esc(o['email'])}</code>\n"
+            f"🔑 Password: <code>{esc(o['password'])}</code></blockquote>\n"
+            f"💰 Harga: {rp(o['price'])}\n🕒 Waktu: {jam}\n📌 Status: <b>✅ Berhasil</b>\n\n"
+            f"💡 <i>Segera login &amp; ganti password. Simpan data ini baik-baik, "
+            f"riwayat bisa dilihat lagi di menu 📜 Riwayat.</i>")
+
+def jimel_card_kb(o):
+    return kb([[copy_btn("📋 Salin Username", o["email"], o["id"], "ju"),
+                copy_btn("🔑 Salin Password", o["password"], o["id"], "jp")],
+               [b("🛒 Beli Lagi", "jm"), b("🏠 Menu Utama", "hm")]])
+
+
+@r.callback_query(F.data == "jm")
+async def jimel_menu(cb: CallbackQuery):
+    price, stock = await jimel_price(), await jimel_stock()
+    bal = await balance(cb.from_user.id, cb.from_user.full_name)
+    bought = await jimel_bought(cb.from_user.id)
+    limit_hit = bought >= JIMEL_MAX_PER_USER
+    note = ("🚫 <i>Kamu sudah mencapai batas maksimal pembelian akun.</i>" if limit_hit else
+            "🔽 <i>Klik tombol di bawah untuk membeli.</i>" if stock else "😔 <i>Stok sedang kosong, silakan cek lagi nanti.</i>")
+    t = (f"📧 <b>BELI {esc(JIMEL_NAME.upper())}</b>\n{LINE}\n"
+         f"<blockquote>💰 Harga: <b>{rp(price)}</b> / akun\n📦 Stok: <b>{stock}</b> akun\n💵 Saldo kamu: <b>{rp(bal)}</b>\n"
+         f"🎟 Sudah dibeli: <b>{bought}/{JIMEL_MAX_PER_USER}</b> akun</blockquote>\n" + note)
+    rows = [[b(f"🛒 Beli 1 Akun · {rp(price)}", "jmb")]] if stock and not limit_hit else []
+    rows.append([b("🏠 Menu Utama", "home")])
+    await show_any(cb, t, kb(rows))
+    await cb.answer()
+
+@r.callback_query(F.data == "jmb")
+async def jimel_buy(cb: CallbackQuery):
+    uid = cb.from_user.id
+    price = await jimel_price()
+    await balance(uid, cb.from_user.full_name)
+    async with _jimel_lock:
+        return await _jimel_buy_locked(cb, uid, price)
+
+async def _jimel_buy_locked(cb, uid, price):
+    if await jimel_bought(uid) >= JIMEL_MAX_PER_USER:
+        return await cb.answer(f"🚫 Batas maksimal {JIMEL_MAX_PER_USER} akun per pengguna sudah tercapai.", show_alert=True)
+    if not await jimel_stock():
+        return await cb.answer("😔 Stok sedang kosong.", show_alert=True)
+    if not await deduct(uid, price):
+        return await cb.answer(f"💵 Saldo tidak cukup. Harga {rp(price)}, silakan top up dulu.", show_alert=True)
+    now = time.time()
+    # ambil 1 akun secara atomik (aman jika banyak user beli bersamaan)
+    got = await run("UPDATE jimel_stock SET status='SOLD', buyer=?, price=?, sold=? "
+                    "WHERE id=(SELECT id FROM jimel_stock WHERE status='READY' ORDER BY id LIMIT 1) AND status='READY'",
+                    (uid, price, now))
+    o = await one("SELECT * FROM jimel_stock WHERE buyer=? AND sold=? ORDER BY id DESC LIMIT 1", (uid, now)) if got else None
+    if not o:
+        await credit(uid, price)
+        return await cb.answer("😔 Stok baru saja habis. Saldo dikembalikan.", show_alert=True)
+    await cb.answer("✅ Pembelian berhasil!")
+    try:   # kartu baru di chat, sama seperti kartu nomor OTP
+        await cb.message.answer_photo(banner_photo(), caption=jimel_card(o), reply_markup=jimel_card_kb(o))
+    except Exception:
+        await cb.message.answer(jimel_card(o), reply_markup=jimel_card_kb(o))
+    left = await jimel_stock()
+    if left <= 3:
+        for a in ADMINS:
+            try:
+                await cb.bot.send_message(a, f"⚠️ Stok {esc(JIMEL_NAME)} tinggal <b>{left}</b>. Ketik /restock untuk menambah.")
+            except Exception:
+                pass
+
+@r.callback_query(F.data.regexp(r"^cp:\d+:j[up]$"))
+async def jimel_copy_fallback(cb: CallbackQuery):
+    _, sid, kind = cb.data.split(":")
+    o = await one("SELECT * FROM jimel_stock WHERE id=? AND buyer=?", (int(sid), cb.from_user.id))
+    if o:
+        await cb.answer(o["email"] if kind == "ju" else o["password"], show_alert=True)
+
+
+# ----- admin: restock -----
+@r.message(Command("restock"))
+async def cmd_restock(m: Message, state: FSMContext):
+    if m.from_user.id not in ADMINS: return
+    await state.clear()
+    await m.answer(f"📦 <b>RESTOCK {esc(JIMEL_NAME.upper())}</b>\n{LINE}\n📦 Stok sekarang: <b>{await jimel_stock()}</b>\n\n"
+                   f"Pilih jenis password akun yang mau dimasukkan:",
+                   reply_markup=kb([[b("🔑 Password Sama", "rsk:same"), b("🔐 Password Berbeda", "rsk:diff")],
+                                    [b("❌ Batal", "rsk:x")]]))
+
+@r.callback_query(F.data.startswith("rsk:"))
+async def restock_mode(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id not in ADMINS: return await cb.answer()
+    mode = cb.data.split(":")[1]
+    await cb.answer()
+    if mode == "x":
+        await state.clear()
+        return await cb.message.edit_text("❌ Restock dibatalkan.")
+    if mode == "same":
+        await state.set_state(Restock.password)
+        await cb.message.edit_text("🔑 <b>Password Sama</b>\n\nSilakan kirim <b>password</b> yang dipakai semua akun:\n\n<i>/batal untuk membatalkan</i>")
+    else:
+        await state.update_data(pw=None)
+        await state.set_state(Restock.akun)
+        await cb.message.edit_text("🔐 <b>Password Berbeda</b>\n\nSilakan kirim akun &amp; password, <b>1 akun per baris</b>:\n"
+                                   "<code>email@gmail.com|password123\nemail2@gmail.com|passwordlain</code>\n\n"
+                                   "<i>Pemisah boleh | atau : atau spasi. /batal untuk membatalkan</i>")
+
+@r.message(Command("batal"))
+async def cmd_batal(m: Message, state: FSMContext):
+    if await state.get_state():
+        await state.clear()
+        await m.answer("❌ Dibatalkan.")
+
+@r.message(Restock.password, F.text)
+async def restock_pw(m: Message, state: FSMContext):
+    if m.from_user.id not in ADMINS: return
+    pw = m.text.strip()
+    await state.update_data(pw=pw)
+    await state.set_state(Restock.akun)
+    await m.answer(f"✅ Password: <code>{esc(pw)}</code>\n\nSekarang kirim daftar akun/email, <b>1 akun per baris</b>:\n"
+                   "<code>email1@gmail.com\nemail2@gmail.com</code>\n\n<i>/batal untuk membatalkan</i>")
+
+@r.message(Restock.akun, F.text)
+async def restock_accounts(m: Message, state: FSMContext):
+    if m.from_user.id not in ADMINS: return
+    pw = (await state.get_data()).get("pw")
+    rows, bad = [], []
+    for line in m.text.splitlines():
+        line = line.strip()
+        if not line: continue
+        if pw:
+            rows.append((line.split()[0], pw))
+            continue
+        parts = re.split(r"\s*[|:]\s*|\s+", line, maxsplit=1)
+        if len(parts) == 2 and parts[0] and parts[1]:
+            rows.append((parts[0], parts[1].strip()))
+        else:
+            bad.append(line)
+    exist = {x["email"].lower() for x in await fetch("SELECT email FROM jimel_stock")}
+    added, dup = 0, 0
+    now = time.time()
+    for email, p in rows:
+        if email.lower() in exist:
+            dup += 1; continue
+        exist.add(email.lower())
+        await db.execute("INSERT INTO jimel_stock(email,password,status,added) VALUES(?,?,'READY',?)", (email, p, now))
+        added += 1
+    await db.commit()
+    await state.clear()
+    t = f"✅ <b>RESTOCK SELESAI</b>\n{LINE}\n➕ Ditambahkan: <b>{added}</b>\n📦 Total stok: <b>{await jimel_stock()}</b>"
+    if dup: t += f"\n♻️ Dilewati (sudah ada): {dup}"
+    if bad: t += f"\n⚠️ Format salah ({len(bad)}):\n<code>" + esc("\n".join(bad[:10])) + "</code>"
+    await m.answer(t)
+
+@r.message(Command("setharga"))
+async def cmd_setharga(m: Message):
+    if m.from_user.id not in ADMINS: return
+    arg = (m.text.split(maxsplit=1) + [""])[1].replace(".", "").replace(",", "").strip()
+    if not arg.isdigit() or int(arg) <= 0:
+        return await m.answer(f"💰 Harga {esc(JIMEL_NAME)} sekarang: <b>{rp(await jimel_price())}</b>\n\nUbah: <code>/setharga 7000</code>")
+    await set_jimel_price(int(arg))
+    await m.answer(f"✅ Harga {esc(JIMEL_NAME)} diubah jadi <b>{rp(int(arg))}</b>")
+
+@r.message(Command("stokakun"))
+async def cmd_stokakun(m: Message):
+    if m.from_user.id not in ADMINS: return
+    s = await one("SELECT SUM(status='READY') r, SUM(status='SOLD') s, COALESCE(SUM(CASE WHEN status='SOLD' THEN price END),0) o FROM jimel_stock")
+    await m.answer(f"📦 <b>STOK {esc(JIMEL_NAME.upper())}</b>\n{LINE}\n🟢 Tersedia: <b>{s['r'] or 0}</b>\n✅ Terjual: <b>{s['s'] or 0}</b>\n"
+                   f"💵 Omzet: {rp(s['o'])}\n💰 Harga: {rp(await jimel_price())}\n\n/restock · /setharga &lt;nominal&gt; · /hapusstok")
+
+@r.message(Command("hapusstok"))
+async def cmd_hapusstok(m: Message):
+    if m.from_user.id not in ADMINS: return
+    n = await run("DELETE FROM jimel_stock WHERE status='READY'")
+    await m.answer(f"🗑 {n} akun yang belum terjual dihapus dari stok.")
 
 
 # ---------- deposit ----------
@@ -1621,7 +1842,7 @@ async def admin(m: Message):
     o = await one("SELECT COUNT(*) c, COALESCE(SUM(price),0) s FROM orders WHERE refunded=0")
     await m.answer(f"🛠 <b>Admin</b>\n{LINE}\n👥 User: {u}\n🧾 Order sukses/aktif: {o['c']}\n💵 Omzet: {rp(o['s'])}\n"
                    f"🏦 Saldo SMSCode: {rp(d['balance']) if d else 'n/a'}\n\n"
-                   f"/addsaldo &lt;user_id&gt; &lt;nominal&gt;\n/topup on|off (buka/tutup top up)\n/casaku (status pembayaran Casaku)\n/saldoall (rekap saldo semua user + CSV; tambah kata <code>channel</code> untuk kirim ke channel WD)\n/wdlist (penarikan referral menunggu)\n/setref &lt;id_pengajak&gt; &lt;id_user...&gt;\n/refstats\n/broadcast &lt;pesan&gt; (manual ke user)\n/trafik (laporan trafik, HANYA ke channel)\n/autobroadcast (promosi harga termurah, HANYA ke user)\n/testchannel\n/backup (kirim file database ke chat ini)\n/restore (kirim file .db dengan caption /restore)")
+                   f"/addsaldo &lt;user_id&gt; &lt;nominal&gt;\n/topup on|off (buka/tutup top up)\n/casaku (status pembayaran Casaku)\n/saldoall (rekap saldo semua user + CSV; tambah kata <code>channel</code> untuk kirim ke channel WD)\n/wdlist (penarikan referral menunggu)\n/setref &lt;id_pengajak&gt; &lt;id_user...&gt;\n/refstats\n/broadcast &lt;pesan&gt; (manual ke user)\n/trafik (laporan trafik, HANYA ke channel)\n/autobroadcast (promosi harga termurah, HANYA ke user)\n/testchannel\n/backup (kirim file database ke chat ini)\n/restore (kirim file .db dengan caption /restore)\n\n📧 <b>Akun Jimel</b>\n/restock (tambah stok, password sama / berbeda)\n/setharga &lt;nominal&gt; (ubah harga)\n/stokakun (stok, terjual, omzet)\n/hapusstok (hapus stok yang belum terjual)\n/batal (batalkan restock)")
 
 @r.message(Command("saldoall"))
 async def saldoall(m: Message, bot: Bot):
