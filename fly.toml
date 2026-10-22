@@ -2,12 +2,15 @@ app = "bot-telr"
 primary_region = "ams"
 
 [build]
-  builder = "paketobuildpacks/builder:base"
+  dockerfile = "Dockerfile"
 
-[processes]
-  app = "python bot.py"
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
 
 [[vm]]
   size = "shared-cpu-1x"
   memory = "256mb"
-  processes = ["app"]
