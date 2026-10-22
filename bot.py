@@ -27,13 +27,14 @@ MARKUP = float(os.getenv("MARKUP_PERCENT", "30"))
 STORE = os.getenv("STORE_NAME", "OTP Store")
 PAY_INFO = os.getenv("PAYMENT_INFO", "Hubungi admin untuk metode pembayaran.").replace("\\n", "\n")
 MIN_DEP = int(os.getenv("MIN_DEPOSIT", "2000"))
-_vol = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()          # otomatis diisi Railway kalau service punya Volume
+_vol = (os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()          # Railway: otomatis diisi kalau service punya Volume
+        or ("/data" if os.getenv("FLY_APP_NAME") else ""))          # Fly.io: volume di-mount ke /data
 DB_PATH = os.getenv("DB_PATH") or (os.path.join(_vol, "store.db") if _vol else "store.db")   # prioritas: DB_PATH > Volume > folder kerja
 AUTO_CANCEL = int(os.getenv("AUTO_CANCEL_MIN", "10")) * 60
 KASERA_KEY = os.getenv("KASERA_API_KEY", "")          # kp_test_... atau kp_live_...
 WH_SECRET = os.getenv("KASERA_WEBHOOK_SECRET", "")    # signing secret endpoint webhook
 # ---- Casaku (QRIS statis -> dinamis, deteksi bayar lewat aplikasi listener di HP) ----
-# Aktif hanya jika PAY_PROVIDER=casaku (default tetap Kasera). Semua nilai diisi lewat Variables Railway.
+# Aktif hanya jika PAY_PROVIDER=casaku (default tetap Kasera). Semua nilai diisi lewat Secrets/Variables hosting (Fly.io).
 CASAKU_BASE = os.getenv("CASAKU_BASE_URL", "https://api.casaku.id").strip().rstrip("/")
 CASAKU_KEY = os.getenv("CASAKU_LICENSE_KEY", "").strip()                  # dashboard casaku.id/api-keys
 CASAKU_QRIS_ID = os.getenv("CASAKU_QRIS_ID", "").strip()                  # UUID QRIS dari dashboard Casaku
@@ -49,7 +50,7 @@ CASAKU_FEE_MIN = int(os.getenv("CASAKU_FEE_MIN") or 250)
 CASAKU_FEE_MAX = int(os.getenv("CASAKU_FEE_MAX") or 399)
 CASAKU_OWN_FEE = 0 < CASAKU_FEE_MIN <= CASAKU_FEE_MAX
 USE_CASAKU = os.getenv("PAY_PROVIDER", "kasera").strip().lower() == "casaku" and bool(CASAKU_KEY and CASAKU_QRIS_ID)
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT") or os.getenv("PORT") or 8080)   # Railway otomatis mengisi PORT
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT") or os.getenv("PORT") or 8080)   # Fly.io: pakai WEBHOOK_PORT (8080)
 FEE_PCT_BPS = round(float(os.getenv("KASERA_FEE_PERCENT", "0.7")) * 100)     # QRIS Kasera 0,7% (dalam basis poin)
 FEE_FIXED = int(os.getenv("KASERA_FEE_FIXED", "250"))                        # QRIS Kasera + Rp250
 LIVE = KASERA_KEY.startswith("kp_live_")
@@ -2239,7 +2240,7 @@ async def get_traffic_report(admin=False):
 async def post_traffic_channel(bot: Bot):
     """Kirim laporan trafik ke channel. Error jika CHANNEL_ID kosong."""
     if not CHANNEL_ID:
-        raise RuntimeError("CHANNEL_ID belum diisi di Variables Railway.")
+        raise RuntimeError("CHANNEL_ID belum diisi di Secrets Fly.")
     text = await get_traffic_report()
     me = await bot.get_me()
     link = kb([[InlineKeyboardButton(text="🛒 Beli Nomor di Bot", url=f"https://t.me/{me.username}")]])
@@ -2424,7 +2425,7 @@ async def cmd_trafik(m: Message):
 async def send_chan_callback(cb: CallbackQuery, bot: Bot):
     if cb.from_user.id not in ADMINS: return await cb.answer("Khusus admin.", show_alert=True)
     if not CHANNEL_ID:
-        return await cb.answer("CHANNEL_ID belum diisi di Variables Railway!", show_alert=True)
+        return await cb.answer("CHANNEL_ID belum diisi di Secrets Fly!", show_alert=True)
     try:
         await post_traffic_channel(bot)
         await cb.answer("✅ Berhasil dikirim ke channel!", show_alert=True)
